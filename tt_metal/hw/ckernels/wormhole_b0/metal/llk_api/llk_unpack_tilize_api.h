@@ -33,10 +33,10 @@ inline void llk_unpack_tilize_init(const std::uint32_t operand, const std::uint3
  *
  * @param operand Input circular buffer / operand index.
  */
-inline void llk_unpack_tilize_uninit(const std::uint32_t operand) {
+inline void llk_unpack_tilize_uninit(const std::uint32_t operand, const std::uint32_t face_r_dim = FACE_R_DIM) {
     std::uint32_t operand_id = get_operand_id(operand);
     const std::uint32_t num_faces = get_operand_num_faces(operand_id);
-    _llk_unpack_tilize_uninit_((uint)unpack_dst_format[operand_id], num_faces);
+    _llk_unpack_tilize_uninit_((uint)unpack_dst_format[operand_id], num_faces, face_r_dim);
 }
 
 /**
