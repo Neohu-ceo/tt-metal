@@ -150,6 +150,14 @@ inline void DataflowBuffer::finish_impl() {
                 continue;
             }
             all_acked = all_acked && (ckernel::trisc::tile_counters[tc_id].f.posted == 0);
+#elif defined(COMPILE_FOR_TRISC) && defined(UCK_CHLKC_PACK)
+            // PACK must wait for UNPACK to drain everything PACK pushed.
+            // posted == 0 means UNPACK has popped all pushed tiles, so UNPACK's
+            // in-place mutation of each tile is complete (the pop_front in the
+            // kernel loop runs AFTER UNPACK's L1 write). Without this wait,
+            // finish() returns immediately for PACK, which would let callers
+            // signal "output ready" while UNPACK is still mid-loop.
+            all_acked = all_acked && (ckernel::trisc::tile_counters[tc_id].f.posted == 0);
 #elif !defined(COMPILE_FOR_TRISC)
             uint8_t tensix_id = dfb::get_tensix_id(packed_tc);
             all_acked &=
@@ -394,7 +402,7 @@ Noc::async_read(
     uint32_t txn_id = dst.prepare_implicit_read();
     noc_async_read_set_trid(txn_id, noc_id_);
     while (noc_available_transactions(noc_id_, txn_id) < ((NOC_MAX_TRANSACTION_ID_COUNT + 1) / 2));
-    // DPRINT("Issue the read\n");
+    // DPRINT << "Issue the read" << ENDL();
     noc_async_read<NOC_MAX_BURST_SIZE + 1, true>(
         get_src_ptr<AddressType::NOC>(src, src_args),
         dst.get_write_ptr(),
@@ -416,7 +424,7 @@ Noc::async_write(
     auto dst_noc_addr = get_dst_ptr<AddressType::NOC>(dst, dst_args);
     RECORD_NOC_EVENT_WITH_ADDR(NocEventType::WRITE_WITH_TRID, src_addr, dst_noc_addr, size_bytes, -1, posted, noc_id_);
     DEBUG_SANITIZE_NOC_WRITE_TRANSACTION(noc_id_, dst_noc_addr, src_addr, src.get_entry_size());
-    // DPRINT("Issue the write\n");
+    // DPRINT << "Issue the write" << ENDL();
     ncrisc_noc_fast_write_any_len<noc_mode, true, /*one_packet*/false>(
         noc_id_,
         write_cmd_buf,
