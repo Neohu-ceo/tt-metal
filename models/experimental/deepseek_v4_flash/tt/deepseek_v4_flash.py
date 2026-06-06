@@ -1,4 +1,5 @@
-from typing import Any
+import os
+from typing import Any, Optional
 
 import ttnn
 import torch
@@ -6,12 +7,86 @@ import torch
 from .weight_loader import DeepseekV4WeightLoader
 
 
+class WeightCache:
+    """On-disk cache namespace for converted ttnn weight tensors.
+
+    Wraps a base directory plus a dotted name prefix. :meth:`file` builds a
+    ``cache_file_name`` for :func:`ttnn.as_tensor` (the first load tilizes and
+    dumps the tensor; later runs read it straight back, skipping re-conversion).
+    A ``None`` path disables caching, so :meth:`file` returns ``None`` and
+    ``as_tensor`` simply converts every time -- this is the default, keeping the
+    modules' behaviour unchanged unless a caller opts in.
+
+    Sub-modules get a namespaced child via :meth:`sub` so every weight maps to a
+    unique, stable path mirroring the checkpoint hierarchy (e.g.
+    ``layers.5.attn.q_a_proj``).
+    """
+
+    __slots__ = ("path", "prefix")
+
+    def __init__(self, path: Optional[str] = None, prefix: str = ""):
+        self.path = path
+        self.prefix = prefix
+
+    def sub(self, name: str) -> "WeightCache":
+        prefix = f"{self.prefix}.{name}" if self.prefix else name
+        return WeightCache(self.path, prefix)
+
+    def _name(self, name: str) -> str:
+        return f"{self.prefix}.{name}" if self.prefix else name
+
+    def file(self, name: str) -> Optional[str]:
+        if not self.path:
+            return None
+        return os.path.join(self.path, self._name(name).replace("/", "_"))
+
+    def hit(self, name: str, dtype: ttnn.DataType, layout: ttnn.Layout = ttnn.TILE_LAYOUT) -> bool:
+        """Whether a cached file already exists for ``name`` (matching the exact
+        ``ttnn.as_tensor`` suffix), so callers can skip producing the torch
+        tensor entirely on a cache hit."""
+        base = self.file(name)
+        if not base:
+            return False
+        return os.path.isfile(f"{base}_dtype_{dtype.name}_layout_{layout.name}.tensorbin")
+
+
+def _as_cache(cache: Optional[WeightCache]) -> WeightCache:
+    """Normalise ``None`` to a disabled cache so call sites stay branch-free."""
+    return cache if cache is not None else WeightCache()
+
+
+def _load_weight(
+    tensor: Optional[torch.Tensor],
+    device: ttnn.MeshDevice,
+    *,
+    cache_file_name: Optional[str] = None,
+    dtype: ttnn.DataType = ttnn.bfloat16,
+    layout: ttnn.Layout = ttnn.TILE_LAYOUT,
+) -> ttnn.Tensor:
+    """``ttnn.as_tensor`` for a (static) weight, with optional disk caching.
+
+    Equivalent to ``ttnn.from_torch(...)`` when ``cache_file_name`` is ``None``;
+    otherwise the tilized tensor is dumped on first use and loaded back on later
+    runs. ``tensor`` may be ``None`` only on a verified cache hit (see
+    :meth:`WeightCache.hit`).
+    """
+    return ttnn.as_tensor(
+        tensor,
+        dtype=dtype,
+        layout=layout,
+        device=device,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        cache_file_name=cache_file_name,
+    )
+
+
 def to_ttnn_device(
     tensor: torch.Tensor,
     device: ttnn.MeshDevice,
     layout: ttnn.Layout = ttnn.TILE_LAYOUT,
+    cache_file_name: Optional[str] = None,
 ) -> ttnn.Tensor:
-    return ttnn.from_torch(tensor, device=device, layout=layout, dtype=ttnn.bfloat16)
+    return _load_weight(tensor, device, cache_file_name=cache_file_name, layout=layout)
 
 
 # ---------------------------------------------------------------------------- #
@@ -86,9 +161,18 @@ class Linear(DeepSeekV4Module):
     store the torch ``[out, in]`` weight transposed.
     """
 
-    def __init__(self, weight: torch.Tensor, device: ttnn.MeshDevice):
-        self.weight = ttnn.from_torch(
-            weight.t().contiguous(), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+    def __init__(
+        self,
+        weight: torch.Tensor,
+        device: ttnn.MeshDevice,
+        cache_file_name: Optional[str] = None,
+        dtype: ttnn.DataType = ttnn.bfloat16,
+    ):
+        self.weight = _load_weight(
+            weight.t().contiguous() if weight is not None else None,
+            device,
+            cache_file_name=cache_file_name,
+            dtype=dtype,
         )
 
     def forward(self, x: ttnn.Tensor) -> ttnn.Tensor:
@@ -98,10 +182,10 @@ class Linear(DeepSeekV4Module):
 class DeepSeekV4RMSNorm(DeepSeekV4Module):
     """Weighted RMSNorm over the last dim (matches ``DeepseekV4RMSNorm``)."""
 
-    def __init__(self, weight: torch.Tensor, eps: float, device: ttnn.MeshDevice):
-        self.weight = ttnn.from_torch(
-            weight.reshape(1, 1, 1, -1), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
-        )
+    def __init__(
+        self, weight: torch.Tensor, eps: float, device: ttnn.MeshDevice, cache_file_name: Optional[str] = None
+    ):
+        self.weight = _load_weight(weight.reshape(1, 1, 1, -1), device, cache_file_name=cache_file_name)
         self.eps = eps
 
     def forward(self, x: ttnn.Tensor) -> ttnn.Tensor:
@@ -137,13 +221,23 @@ def _apply_rope(x: ttnn.Tensor, cos: ttnn.Tensor, sin: ttnn.Tensor, rot: ttnn.Te
 
 
 class DeepSeekV4Embedding(DeepSeekV4Module):
-    def __init__(self, weight_loader: DeepseekV4WeightLoader, device: ttnn.MeshDevice):
+    def __init__(
+        self,
+        weight_loader: DeepseekV4WeightLoader,
+        device: ttnn.MeshDevice,
+        cache: Optional[WeightCache] = None,
+    ):
         self.weight_loader = weight_loader
         self.device = device
+        cache = _as_cache(cache)
         # ``ttnn.embedding`` expects a row-major weight table.
-        self.embedding_weight = to_ttnn_device(
-            weight_loader.get_tensor("embed_tokens.weight"), device, layout=ttnn.ROW_MAJOR_LAYOUT
+        cfn = cache.file("embed_tokens")
+        embed = (
+            None
+            if cache.hit("embed_tokens", ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT)
+            else weight_loader.get_tensor("embed_tokens.weight")
         )
+        self.embedding_weight = to_ttnn_device(embed, device, layout=ttnn.ROW_MAJOR_LAYOUT, cache_file_name=cfn)
 
     def forward(self, input_ids: ttnn.Tensor) -> ttnn.Tensor:
         return ttnn.embedding(input_ids, self.embedding_weight, layout=ttnn.TILE_LAYOUT)
@@ -159,13 +253,23 @@ class DeepSeekV4Flash(DeepSeekV4Module):
     parameter.
     """
 
-    def __init__(self, config: dict, weights_dir: str, device: ttnn.MeshDevice):
+    def __init__(
+        self,
+        config: dict,
+        weights_dir: str,
+        device: ttnn.MeshDevice,
+        cache_dir: Optional[str] = None,
+    ):
         super().__init__()
         self.config = config
         self.weights_dir = weights_dir
         self.device = device
         self.weight_loader = DeepseekV4WeightLoader(weights_dir)
-        self.embed_tokens = DeepSeekV4Embedding(self.weight_loader, device)
+        # Converted-weight cache (opt-in): pass ``cache_dir`` to dump/reuse the
+        # tilized ttnn tensors across runs (skipping re-conversion / dequant).
+        # ``None`` keeps caching off, so weights are converted every time.
+        self.cache = WeightCache(cache_dir)
+        self.embed_tokens = DeepSeekV4Embedding(self.weight_loader, device, cache=self.cache)
 
     def load_weights(self) -> None:
         """Populate the model's submodules from the safetensors checkpoint.
@@ -209,22 +313,37 @@ class DeepSeekV4HCACompressor:
     ready to concat onto the sliding KV axis.
     """
 
-    def __init__(self, config, weights: dict, device, rot, rope_dim: int):
+    def __init__(
+        self,
+        config,
+        weights: dict,
+        device,
+        rot,
+        rope_dim: int,
+        cache: Optional[WeightCache] = None,
+        weight_dtype: ttnn.DataType = ttnn.bfloat16,
+    ):
         self.device = device
         self.rope_dim = rope_dim
         self.rot = rot
         self.eps = config.rms_norm_eps
         self.head_dim = config.head_dim
         self.compress_rate = config.compress_rates["heavily_compressed_attention"]
-        self.kv_proj = Linear(weights["compressor.kv_proj.weight"], device)
-        self.gate_proj = Linear(weights["compressor.gate_proj.weight"], device)
-        self.kv_norm = DeepSeekV4RMSNorm(weights["compressor.kv_norm.weight"], self.eps, device)
+        cache = _as_cache(cache)
+        self.kv_proj = Linear(
+            weights["compressor.kv_proj.weight"], device, cache.file("compressor.kv_proj"), dtype=weight_dtype
+        )
+        self.gate_proj = Linear(
+            weights["compressor.gate_proj.weight"], device, cache.file("compressor.gate_proj"), dtype=weight_dtype
+        )
+        self.kv_norm = DeepSeekV4RMSNorm(
+            weights["compressor.kv_norm.weight"], self.eps, device, cache.file("compressor.kv_norm")
+        )
         # position_bias: [compress_rate, head_dim] -> broadcast over [B, n_win].
-        self.position_bias = ttnn.from_torch(
+        self.position_bias = _load_weight(
             weights["compressor.position_bias"].reshape(1, 1, self.compress_rate, self.head_dim),
-            dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
-            device=device,
+            device,
+            cache_file_name=cache.file("compressor.position_bias"),
         )
 
     def __call__(self, hidden: ttnn.Tensor, cos_win: ttnn.Tensor, sin_win: ttnn.Tensor) -> ttnn.Tensor | None:
@@ -266,21 +385,36 @@ class DeepSeekV4CSACompressor:
     values themselves (this module's output) do not depend on the indexer.
     """
 
-    def __init__(self, config, weights: dict, device, rot, rope_dim: int):
+    def __init__(
+        self,
+        config,
+        weights: dict,
+        device,
+        rot,
+        rope_dim: int,
+        cache: Optional[WeightCache] = None,
+        weight_dtype: ttnn.DataType = ttnn.bfloat16,
+    ):
         self.device = device
         self.rope_dim = rope_dim
         self.rot = rot
         self.eps = config.rms_norm_eps
         self.head_dim = config.head_dim
         self.compress_rate = config.compress_rates["compressed_sparse_attention"]
-        self.kv_proj = Linear(weights["compressor.kv_proj.weight"], device)
-        self.gate_proj = Linear(weights["compressor.gate_proj.weight"], device)
-        self.kv_norm = DeepSeekV4RMSNorm(weights["compressor.kv_norm.weight"], self.eps, device)
-        self.position_bias = ttnn.from_torch(
+        cache = _as_cache(cache)
+        self.kv_proj = Linear(
+            weights["compressor.kv_proj.weight"], device, cache.file("compressor.kv_proj"), dtype=weight_dtype
+        )
+        self.gate_proj = Linear(
+            weights["compressor.gate_proj.weight"], device, cache.file("compressor.gate_proj"), dtype=weight_dtype
+        )
+        self.kv_norm = DeepSeekV4RMSNorm(
+            weights["compressor.kv_norm.weight"], self.eps, device, cache.file("compressor.kv_norm")
+        )
+        self.position_bias = _load_weight(
             weights["compressor.position_bias"].reshape(1, 1, self.compress_rate, 2 * self.head_dim),
-            dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
-            device=device,
+            device,
+            cache_file_name=cache.file("compressor.position_bias"),
         )
 
     def __call__(self, hidden: ttnn.Tensor, cos_win: ttnn.Tensor, sin_win: ttnn.Tensor) -> ttnn.Tensor | None:
@@ -342,7 +476,15 @@ class DeepSeekV4Attention(DeepSeekV4Module):
     surrounding model in the reference, not by the attention block.
     """
 
-    def __init__(self, config, layer_idx: int, weights: dict, device: ttnn.MeshDevice):
+    def __init__(
+        self,
+        config,
+        layer_idx: int,
+        weights: dict,
+        device: ttnn.MeshDevice,
+        cache: Optional[WeightCache] = None,
+        weight_dtype: ttnn.DataType = ttnn.bfloat16,
+    ):
         self.config = config
         self.layer_idx = layer_idx
         self.device = device
@@ -354,13 +496,14 @@ class DeepSeekV4Attention(DeepSeekV4Module):
         self.o_lora_rank = config.o_lora_rank
         self.eps = config.rms_norm_eps
         self.scaling = self.head_dim**-0.5
+        cache = _as_cache(cache)
 
-        self.q_a_proj = Linear(weights["q_a_proj.weight"], device)
-        self.q_a_norm = DeepSeekV4RMSNorm(weights["q_a_norm.weight"], self.eps, device)
-        self.q_b_proj = Linear(weights["q_b_proj.weight"], device)
-        self.kv_proj = Linear(weights["kv_proj.weight"], device)
-        self.kv_norm = DeepSeekV4RMSNorm(weights["kv_norm.weight"], self.eps, device)
-        self.o_b_proj = Linear(weights["o_b_proj.weight"], device)
+        self.q_a_proj = Linear(weights["q_a_proj.weight"], device, cache.file("q_a_proj"), dtype=weight_dtype)
+        self.q_a_norm = DeepSeekV4RMSNorm(weights["q_a_norm.weight"], self.eps, device, cache.file("q_a_norm"))
+        self.q_b_proj = Linear(weights["q_b_proj.weight"], device, cache.file("q_b_proj"), dtype=weight_dtype)
+        self.kv_proj = Linear(weights["kv_proj.weight"], device, cache.file("kv_proj"), dtype=weight_dtype)
+        self.kv_norm = DeepSeekV4RMSNorm(weights["kv_norm.weight"], self.eps, device, cache.file("kv_norm"))
+        self.o_b_proj = Linear(weights["o_b_proj.weight"], device, cache.file("o_b_proj"), dtype=weight_dtype)
 
         # Grouped output projection (``DeepseekV4GroupedLinear``): block-diagonal
         # over o_groups. Store the per-group weight as [g, in_per_group, out_per_group]
@@ -368,17 +511,18 @@ class DeepSeekV4Attention(DeepSeekV4Module):
         oa = weights["o_a_proj.weight"]  # [g*o_lora_rank, (H*Dh)//g]
         in_per_group = (self.num_heads * self.head_dim) // self.o_groups
         oa = oa.reshape(self.o_groups, self.o_lora_rank, in_per_group).transpose(1, 2).contiguous()
-        self.o_a_weight = ttnn.from_torch(oa, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.o_a_weight = _load_weight(oa, device, cache_file_name=cache.file("o_a_proj"), dtype=weight_dtype)
 
         self.sinks_torch = weights["sinks"].reshape(1, self.num_heads, 1, 1).float()
 
-        self.rot = ttnn.from_torch(
-            _interleaved_rotate_matrix(self.rope_dim), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
-        )
+        # The rotate-half matrix must stay precise (a bf4 rotation would corrupt RoPE).
+        self.rot = _load_weight(_interleaved_rotate_matrix(self.rope_dim), device, cache_file_name=cache.file("rot"))
 
         compressor_cls = _COMPRESSORS.get(self.layer_type)
         self.compressor = (
-            compressor_cls(config, weights, device, self.rot, self.rope_dim) if compressor_cls is not None else None
+            compressor_cls(config, weights, device, self.rot, self.rope_dim, cache=cache, weight_dtype=weight_dtype)
+            if compressor_cls is not None
+            else None
         )
 
     def _attention(self, q: ttnn.Tensor, kv: ttnn.Tensor, mask: ttnn.Tensor) -> ttnn.Tensor:
@@ -509,10 +653,24 @@ class DeepSeekV4MLP(DeepSeekV4Module):
     no clamp (the routed experts clamp; the shared expert does not).
     """
 
-    def __init__(self, weights: dict, prefix: str, device: ttnn.MeshDevice):
-        self.gate_proj = Linear(weights[f"{prefix}.gate_proj.weight"], device)
-        self.up_proj = Linear(weights[f"{prefix}.up_proj.weight"], device)
-        self.down_proj = Linear(weights[f"{prefix}.down_proj.weight"], device)
+    def __init__(
+        self,
+        weights: dict,
+        prefix: str,
+        device: ttnn.MeshDevice,
+        cache: Optional[WeightCache] = None,
+        weight_dtype: ttnn.DataType = ttnn.bfloat16,
+    ):
+        cache = _as_cache(cache)
+        self.gate_proj = Linear(
+            weights[f"{prefix}.gate_proj.weight"], device, cache.file(f"{prefix}.gate_proj"), dtype=weight_dtype
+        )
+        self.up_proj = Linear(
+            weights[f"{prefix}.up_proj.weight"], device, cache.file(f"{prefix}.up_proj"), dtype=weight_dtype
+        )
+        self.down_proj = Linear(
+            weights[f"{prefix}.down_proj.weight"], device, cache.file(f"{prefix}.down_proj"), dtype=weight_dtype
+        )
 
     def forward(self, x: ttnn.Tensor) -> ttnn.Tensor:
         gate = ttnn.silu(self.gate_proj(x))
@@ -530,17 +688,17 @@ class DeepSeekV4TopKRouter(DeepSeekV4Module):
     experts carry weight 0, which lets the dense expert compute drop them.
     """
 
-    def __init__(self, config, weights: dict, device: ttnn.MeshDevice):
+    def __init__(self, config, weights: dict, device: ttnn.MeshDevice, cache: Optional[WeightCache] = None):
         self.device = device
         self.num_experts = config.num_local_experts
         self.top_k = config.num_experts_per_tok
         self.routed_scaling_factor = config.routed_scaling_factor
-        self.gate = Linear(weights["gate.weight"], device)
-        self.e_score_correction_bias = ttnn.from_torch(
+        cache = _as_cache(cache)
+        self.gate = Linear(weights["gate.weight"], device, cache.file("gate"))
+        self.e_score_correction_bias = _load_weight(
             weights["gate.e_score_correction_bias"].reshape(1, 1, 1, self.num_experts),
-            dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
-            device=device,
+            device,
+            cache_file_name=cache.file("gate.e_score_correction_bias"),
         )
 
     def forward(self, x_flat: ttnn.Tensor) -> ttnn.Tensor:
@@ -564,6 +722,52 @@ class DeepSeekV4TopKRouter(DeepSeekV4Module):
         # normalised per token, then scaled. Masking before the sum makes the
         # dense [1,1,T,E] tensor equal the reference's gathered/normalised one.
         selected = ttnn.multiply(scores, mask)
+        denom = ttnn.add(ttnn.sum(selected, dim=-1, keepdim=True), 1.0e-20)
+        return ttnn.multiply(ttnn.div(selected, denom), self.routed_scaling_factor)
+
+
+class DeepSeekV4HashRouter(DeepSeekV4Module):
+    """ttnn port of ``DeepseekV4HashRouter`` (the first ``num_hash_layers`` MoE
+    layers, paper §2.1).
+
+    Expert *selection* is a frozen ``tid2eid[input_ids]`` lookup — a fixed
+    token-id -> expert-id table — rather than a learned top-k argmax. The learned
+    gate still produces the per-expert ``sqrtsoftplus`` scores that weight the
+    selected experts; only the *which-experts* decision is static. As with
+    :class:`DeepSeekV4TopKRouter` we emit a dense ``[1,1,T,E]`` weight tensor
+    (selected experts carry their renormalised score, the rest are 0) so the same
+    dense / preloaded expert compute consumes it.
+
+    The selection mask is built host-side from ``input_ids`` (known at call time)
+    — no on-device gather/scatter is needed since the table is fixed.
+    """
+
+    def __init__(self, config, weights: dict, device: ttnn.MeshDevice, cache: Optional[WeightCache] = None):
+        self.device = device
+        self.num_experts = config.num_local_experts
+        self.top_k = config.num_experts_per_tok
+        self.routed_scaling_factor = config.routed_scaling_factor
+        cache = _as_cache(cache)
+        self.gate = Linear(weights["gate.weight"], device, cache.file("gate"))
+        # tid2eid [vocab, top_k]: frozen token-id -> expert-id table (host-side).
+        self.tid2eid = weights["gate.tid2eid"].long()
+
+    def forward(self, x_flat: ttnn.Tensor, input_ids: torch.Tensor) -> ttnn.Tensor:
+        """``x_flat`` ``[1,1,T,H]`` and ``input_ids`` torch ``[..]`` (T tokens);
+        returns dense routing weights ``[1,1,T,E]``."""
+        logits = self.gate(x_flat)  # [1, 1, T, E]
+        scores = ttnn.sqrt(ttnn.softplus(logits))
+        t = x_flat.shape[2]
+
+        # Static per-token expert selection -> host one-hot mask [1,1,T,E].
+        eids = self.tid2eid[input_ids.reshape(-1).long()]  # [T, top_k]
+        mask = torch.zeros(t, self.num_experts, dtype=torch.float32)
+        mask.scatter_(1, eids, 1.0)
+        mask_tt = ttnn.from_torch(
+            mask.reshape(1, 1, t, self.num_experts), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.device
+        )
+
+        selected = ttnn.multiply(scores, mask_tt)
         denom = ttnn.add(ttnn.sum(selected, dim=-1, keepdim=True), 1.0e-20)
         return ttnn.multiply(ttnn.div(selected, denom), self.routed_scaling_factor)
 
@@ -608,24 +812,45 @@ class DeepSeekV4PreloadedExperts(DeepSeekV4Module):
     ``hit`` set), so only the experts some token actually selected are computed.
     """
 
-    def __init__(self, config, provider, device: ttnn.MeshDevice, dtype: ttnn.DataType = ttnn.bfloat4_b):
+    def __init__(
+        self,
+        config,
+        provider,
+        device: ttnn.MeshDevice,
+        dtype: ttnn.DataType = ttnn.bfloat4_b,
+        cache: Optional[WeightCache] = None,
+    ):
         self.device = device
         self.num_experts = config.num_local_experts
         self.intermediate = config.moe_intermediate_size
         self.hidden = config.hidden_size
         self.limit = config.swiglu_limit
+        cache = _as_cache(cache)
 
         # Upload every expert once, transposed to matmul-ready [H, 2I] / [I, H]
-        # and stored in low precision on device.
+        # and stored in low precision on device. With caching enabled and a hit,
+        # the provider (and its expensive dequant) is skipped entirely.
         self._gate_up: list[ttnn.Tensor] = []
         self._down: list[ttnn.Tensor] = []
         for e in range(self.num_experts):
-            gate_up_w, down_w = provider(e)  # host torch: [2I, H], [H, I]
+            gu_name, dn_name = f"experts.{e}.gate_up", f"experts.{e}.down"
+            need_torch = not (cache.hit(gu_name, dtype) and cache.hit(dn_name, dtype))
+            gate_up_w, down_w = provider(e) if need_torch else (None, None)
             self._gate_up.append(
-                ttnn.from_torch(gate_up_w.t().contiguous(), dtype=dtype, layout=ttnn.TILE_LAYOUT, device=device)
+                _load_weight(
+                    gate_up_w.t().contiguous() if gate_up_w is not None else None,
+                    device,
+                    cache_file_name=cache.file(gu_name),
+                    dtype=dtype,
+                )
             )
             self._down.append(
-                ttnn.from_torch(down_w.t().contiguous(), dtype=dtype, layout=ttnn.TILE_LAYOUT, device=device)
+                _load_weight(
+                    down_w.t().contiguous() if down_w is not None else None,
+                    device,
+                    cache_file_name=cache.file(dn_name),
+                    dtype=dtype,
+                )
             )
 
     def expert_matmul_weights(self, e: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -674,20 +899,21 @@ class DeepSeekV4Experts(DeepSeekV4Module):
     batched matmul (batch axis = expert) projects all experts at once.
     """
 
-    def __init__(self, config, weights: dict, device: ttnn.MeshDevice):
+    def __init__(self, config, weights: dict, device: ttnn.MeshDevice, cache: Optional[WeightCache] = None):
         self.device = device
         self.num_experts = config.num_local_experts
         self.intermediate = config.moe_intermediate_size
         self.hidden = config.hidden_size
         self.limit = config.swiglu_limit
+        cache = _as_cache(cache)
 
         gate_up = weights["experts.gate_up_proj"]  # [E, 2I, H]
         gate_up = gate_up.transpose(1, 2).contiguous().unsqueeze(0)  # [1, E, H, 2I]
-        self.gate_up_proj = ttnn.from_torch(gate_up, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.gate_up_proj = _load_weight(gate_up, device, cache_file_name=cache.file("experts.gate_up_proj"))
 
         down = weights["experts.down_proj"]  # [E, H, I]
         down = down.transpose(1, 2).contiguous().unsqueeze(0)  # [1, E, I, H]
-        self.down_proj = ttnn.from_torch(down, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
+        self.down_proj = _load_weight(down, device, cache_file_name=cache.file("experts.down_proj"))
 
     def _apply_gate(self, gate_up: ttnn.Tensor) -> ttnn.Tensor:
         """Clamp + SiLU-GLU on the packed ``[..., 2I]`` gate_up output."""
@@ -717,22 +943,39 @@ class DeepSeekV4SparseMoeBlock(DeepSeekV4Module):
     ``routed = experts(router(x)) ; return routed + shared_experts(x)``.
     """
 
-    def __init__(self, config, weights: dict, device: ttnn.MeshDevice, experts=None):
+    def __init__(
+        self,
+        config,
+        weights: dict,
+        device: ttnn.MeshDevice,
+        experts=None,
+        gate=None,
+        cache: Optional[WeightCache] = None,
+        weight_dtype: ttnn.DataType = ttnn.bfloat16,
+    ):
         self.device = device
         self.hidden = config.hidden_size
-        self.gate = DeepSeekV4TopKRouter(config, weights, device)
+        cache = _as_cache(cache)
+        # ``gate`` may be injected (e.g. a :class:`DeepSeekV4HashRouter` for the
+        # first ``num_hash_layers`` layers); otherwise the learned top-k router.
+        self.gate = gate if gate is not None else DeepSeekV4TopKRouter(config, weights, device, cache=cache)
+        self.is_hash = isinstance(self.gate, DeepSeekV4HashRouter)
         # ``experts`` may be injected (e.g. a device-resident BFloat4
         # :class:`DeepSeekV4PreloadedExperts` for the real 256-expert
         # checkpoint); otherwise build the dense stacked-weights variant.
-        self.experts = experts if experts is not None else DeepSeekV4Experts(config, weights, device)
-        self.shared_experts = DeepSeekV4MLP(weights, "shared_experts", device)
+        self.experts = experts if experts is not None else DeepSeekV4Experts(config, weights, device, cache=cache)
+        self.shared_experts = DeepSeekV4MLP(weights, "shared_experts", device, cache=cache, weight_dtype=weight_dtype)
 
-    def forward(self, hidden: ttnn.Tensor) -> ttnn.Tensor:
-        """``hidden`` ``[B, S, H]`` -> ``[B, S, H]``."""
+    def forward(self, hidden: ttnn.Tensor, input_ids: Optional[torch.Tensor] = None) -> ttnn.Tensor:
+        """``hidden`` ``[B, S, H]`` -> ``[B, S, H]``. ``input_ids`` is required
+        only for hash-routed layers (frozen ``tid2eid`` selection)."""
         b, s, h = hidden.shape
         x_flat = ttnn.reshape(hidden, [1, 1, b * s, h])
 
-        routing_weights = self.gate(x_flat)  # [1, 1, T, E]
+        if self.is_hash:
+            routing_weights = self.gate(x_flat, input_ids)  # [1, 1, T, E]
+        else:
+            routing_weights = self.gate(x_flat)  # [1, 1, T, E]
         routed = self.experts(x_flat, routing_weights)  # [1, 1, T, H]
         routed = ttnn.reshape(routed, [b, s, h])
 
@@ -760,13 +1003,14 @@ class DeepSeekV4HyperConnection(DeepSeekV4Module):
     See ``modular_deepseek_v4.py`` for the reference math.
     """
 
-    def __init__(self, config, weights: dict, device: ttnn.MeshDevice):
+    def __init__(self, config, weights: dict, device: ttnn.MeshDevice, cache: Optional[WeightCache] = None):
         self.device = device
         self.hc = config.hc_mult
         self.hidden = config.hidden_size
         self.iters = config.hc_sinkhorn_iters
         self.eps = config.hc_eps
         self.norm_eps = config.rms_norm_eps
+        cache = _as_cache(cache)
 
         hc = self.hc
         fn = weights["fn"]  # [(2+H)*H, H*D]
@@ -774,20 +1018,13 @@ class DeepSeekV4HyperConnection(DeepSeekV4Module):
         scale = weights["scale"].flatten().tolist()  # 3 learned scalars
 
         # Split the packed projection into pre [H], post [H], comb [H*H] rows.
-        self.fn_pre = Linear(fn[:hc], device)
-        self.fn_post = Linear(fn[hc : 2 * hc], device)
-        self.fn_comb = Linear(fn[2 * hc : 2 * hc + hc * hc], device)
-        self.pre_b = ttnn.from_torch(
-            base[:hc].reshape(1, 1, 1, hc), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
-        )
-        self.post_b = ttnn.from_torch(
-            base[hc : 2 * hc].reshape(1, 1, 1, hc), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
-        )
-        self.comb_b = ttnn.from_torch(
-            base[2 * hc : 2 * hc + hc * hc].reshape(1, 1, 1, hc * hc),
-            dtype=ttnn.bfloat16,
-            layout=ttnn.TILE_LAYOUT,
-            device=device,
+        self.fn_pre = Linear(fn[:hc], device, cache.file("fn_pre"))
+        self.fn_post = Linear(fn[hc : 2 * hc], device, cache.file("fn_post"))
+        self.fn_comb = Linear(fn[2 * hc : 2 * hc + hc * hc], device, cache.file("fn_comb"))
+        self.pre_b = _load_weight(base[:hc].reshape(1, 1, 1, hc), device, cache_file_name=cache.file("pre_b"))
+        self.post_b = _load_weight(base[hc : 2 * hc].reshape(1, 1, 1, hc), device, cache_file_name=cache.file("post_b"))
+        self.comb_b = _load_weight(
+            base[2 * hc : 2 * hc + hc * hc].reshape(1, 1, 1, hc * hc), device, cache_file_name=cache.file("comb_b")
         )
         self.pre_scale, self.post_scale, self.comb_scale = (float(scale[0]), float(scale[1]), float(scale[2]))
 
@@ -827,3 +1064,172 @@ class DeepSeekV4HyperConnection(DeepSeekV4Module):
         comb = ttnn.reshape(comb, [b, s, hc, hc])
         collapsed = ttnn.reshape(collapsed, [b, s, d])
         return post, comb, collapsed
+
+
+class DeepSeekV4HyperHead(DeepSeekV4Module):
+    """ttnn port of ``DeepseekV4HyperHead`` (final HC-stream collapse).
+
+    Collapses the ``hc_mult`` residual streams ``[B, S, H, D]`` into a single
+    ``[B, S, D]`` sequence before the model's shared RMSNorm + ``lm_head``::
+
+        flat  = unweighted_rmsnorm(streams.flatten(2))
+        pre   = sigmoid(hc_fn @ flat * hc_scale + hc_base) + eps
+        out   = (pre[..,None] * streams).sum(dim=2)
+
+    ``weights`` keys: ``hc_fn`` ``[H, H*D]``, ``hc_base`` ``[H]``, ``hc_scale``
+    (scalar). Unlike :class:`DeepSeekV4HyperConnection` there is no ``post`` /
+    ``comb`` placement: the head only produces the collapsed sequence.
+    """
+
+    def __init__(self, config, weights: dict, device: ttnn.MeshDevice, cache: Optional[WeightCache] = None):
+        self.device = device
+        self.hc = config.hc_mult
+        self.hidden = config.hidden_size
+        self.eps = config.hc_eps
+        self.norm_eps = config.rms_norm_eps
+        cache = _as_cache(cache)
+
+        self.fn = Linear(weights["hc_fn"], device, cache.file("hc_fn"))  # [H, H*D]
+        self.base = _load_weight(
+            weights["hc_base"].reshape(1, 1, 1, self.hc), device, cache_file_name=cache.file("hc_base")
+        )
+        self.scale = float(weights["hc_scale"].flatten().tolist()[0])
+
+    def forward(self, hidden_streams: ttnn.Tensor) -> ttnn.Tensor:
+        """``hidden_streams`` ``[B, S, H, D]`` -> ``[B, S, D]``."""
+        b, s, hc, d = hidden_streams.shape
+        t = b * s
+
+        flat = ttnn.reshape(hidden_streams, [1, 1, t, hc * d])
+        flat = _rms_norm_unweighted(flat, self.norm_eps)
+
+        mixes = self.fn(flat)  # [1,1,T,H]
+        pre = ttnn.add(ttnn.sigmoid(ttnn.add(ttnn.multiply(mixes, self.scale), self.base)), self.eps)
+
+        hs = ttnn.reshape(hidden_streams, [1, t, hc, d])
+        pre_col = ttnn.reshape(pre, [1, t, hc, 1])
+        out = ttnn.sum(ttnn.multiply(hs, pre_col), dim=-2, keepdim=True)  # [1,T,1,D]
+        return ttnn.reshape(out, [b, s, d])
+
+
+def _strip_prefix(weights: dict, prefix: str) -> dict:
+    """Sub-dict of ``weights`` whose keys start with ``prefix.`` (prefix stripped)."""
+    p = f"{prefix}."
+    return {k[len(p) :]: v for k, v in weights.items() if k.startswith(p)}
+
+
+class DeepSeekV4DecoderLayer(DeepSeekV4Module):
+    """ttnn port of ``DeepseekV4DecoderLayer`` (prefill).
+
+    The residual is a stack of ``hc_mult`` parallel streams kept in
+    ``[B, S, H, D]`` (``H`` = ``hc_mult``, ``D`` = ``hidden_size``) throughout the
+    block, mixed in/out by two :class:`DeepSeekV4HyperConnection` modules. For
+    each sublayer (attention, then MoE) the matching HC collapses the streams
+    into the sublayer input, and the sublayer output is folded back into the
+    streams via the learned ``post`` placement weights plus the Sinkhorn
+    ``comb`` stream-mixing matrix::
+
+        post, comb, collapsed = hc(streams)
+        out = sublayer(norm(collapsed))
+        streams = post[..,None] * out[..,None,:] + (comb.T @ streams)
+
+    ``comb`` is consumed *transposed* (mix over the first hc axis), matching the
+    reference ``torch.matmul(comb.transpose(-1, -2), streams)``.
+
+    ``weights`` keys mirror the HF decoder-layer param names: ``self_attn.*``,
+    ``mlp.*``, ``attn_hc.{fn,base,scale}``, ``ffn_hc.{fn,base,scale}``,
+    ``input_layernorm.weight``, ``post_attention_layernorm.weight``. RoPE tables
+    and the additive mask are inputs (built by the surrounding model / test, per
+    :func:`make_rope_table`), exactly as for :class:`DeepSeekV4Attention`.
+    """
+
+    def __init__(
+        self,
+        config,
+        layer_idx: int,
+        weights: dict,
+        device: ttnn.MeshDevice,
+        experts=None,
+        gate=None,
+        cache: Optional[WeightCache] = None,
+        weight_dtype: ttnn.DataType = ttnn.bfloat16,
+    ):
+        self.config = config
+        self.layer_idx = layer_idx
+        self.device = device
+        eps = config.rms_norm_eps
+        cache = _as_cache(cache)
+
+        self.self_attn = DeepSeekV4Attention(
+            config,
+            layer_idx,
+            _strip_prefix(weights, "self_attn"),
+            device,
+            cache=cache.sub("self_attn"),
+            weight_dtype=weight_dtype,
+        )
+        self.mlp = DeepSeekV4SparseMoeBlock(
+            config,
+            _strip_prefix(weights, "mlp"),
+            device,
+            experts=experts,
+            gate=gate,
+            cache=cache.sub("mlp"),
+            weight_dtype=weight_dtype,
+        )
+        self.input_layernorm = DeepSeekV4RMSNorm(
+            weights["input_layernorm.weight"], eps, device, cache.file("input_layernorm")
+        )
+        self.post_attention_layernorm = DeepSeekV4RMSNorm(
+            weights["post_attention_layernorm.weight"], eps, device, cache.file("post_attention_layernorm")
+        )
+        self.attn_hc = DeepSeekV4HyperConnection(
+            config, _strip_prefix(weights, "attn_hc"), device, cache=cache.sub("attn_hc")
+        )
+        self.ffn_hc = DeepSeekV4HyperConnection(
+            config, _strip_prefix(weights, "ffn_hc"), device, cache=cache.sub("ffn_hc")
+        )
+
+    def _mix(
+        self, post: ttnn.Tensor, comb: ttnn.Tensor, sublayer_out: ttnn.Tensor, streams: ttnn.Tensor
+    ) -> ttnn.Tensor:
+        """``post[..,None] * out[..,None,:] + comb.T @ streams`` -> new streams.
+
+        ``post`` ``[B,S,H]``, ``comb`` ``[B,S,H,H]``, ``sublayer_out`` ``[B,S,D]``,
+        ``streams`` ``[B,S,H,D]``; returns ``[B,S,H,D]``.
+        """
+        b, s, hc, d = streams.shape
+        t = b * s
+
+        # placement = post.unsqueeze(-1) * sublayer_out.unsqueeze(-2) -> [1,T,H,D].
+        out = ttnn.reshape(sublayer_out, [1, t, 1, d])
+        out = ttnn.repeat(out, ttnn.Shape([1, 1, hc, 1]))  # broadcast over the stream axis
+        placement = ttnn.multiply(out, ttnn.reshape(post, [1, t, hc, 1]))
+
+        # mix = matmul(comb.transpose(-1, -2), streams): sum over the FIRST hc axis.
+        comb_t = ttnn.transpose(ttnn.reshape(comb, [1, t, hc, hc]), -2, -1)
+        mixed = ttnn.matmul(comb_t, ttnn.reshape(streams, [1, t, hc, d]), compute_kernel_config=_HIFI4)
+
+        return ttnn.reshape(ttnn.add(placement, mixed), [b, s, hc, d])
+
+    def forward(
+        self,
+        hidden_streams: ttnn.Tensor,
+        cos: ttnn.Tensor,
+        sin: ttnn.Tensor,
+        neg_sin: ttnn.Tensor,
+        mask: ttnn.Tensor,
+        cos_win: ttnn.Tensor | None = None,
+        sin_win: ttnn.Tensor | None = None,
+        input_ids: Optional[torch.Tensor] = None,
+    ) -> ttnn.Tensor:
+        """``hidden_streams`` ``[B, S, hc_mult, D]`` -> updated streams ``[B, S, hc_mult, D]``."""
+        post, comb, collapsed = self.attn_hc(hidden_streams)
+        attn_out = self.self_attn(
+            self.input_layernorm(collapsed), cos, sin, neg_sin, mask, cos_win=cos_win, sin_win=sin_win
+        )
+        hidden_streams = self._mix(post, comb, attn_out, hidden_streams)
+
+        post, comb, collapsed = self.ffn_hc(hidden_streams)
+        mlp_out = self.mlp(self.post_attention_layernorm(collapsed), input_ids=input_ids)
+        return self._mix(post, comb, mlp_out, hidden_streams)
