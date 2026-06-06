@@ -20,6 +20,7 @@ from loguru import logger
 
 import ttnn
 from models.common.utility_functions import comp_allclose, comp_pcc
+from models.experimental.deepseek_v4_flash.tt.deepseek_v4_flash import DeepSeekV4Flash
 from models.experimental.deepseek_v4_flash.tt.weight_loader import (
     DeepseekV4WeightLoader,
     resolve_snapshot_dir,
@@ -96,3 +97,56 @@ def test_embed_tokens_pcc(
     logger.info(f"PCC: {pcc_message}")
 
     assert passing, f"embed_tokens PCC < {PCC_THRESHOLD} (batch={batch_size}, seq={seq_len}): {pcc_message}"
+
+
+@pytest.mark.skipif(
+    not _checkpoint_available(),
+    reason=f"V4-Flash checkpoint not found under {DEFAULT_MODEL_DIR}",
+)
+@torch.no_grad()
+@pytest.mark.parametrize("batch_size", (1, 4))
+@pytest.mark.parametrize("seq_len", (32, 128))
+def test_deepseek_v4_flash_forward_pcc(
+    device,
+    reset_seeds,
+    batch_size: int,
+    seq_len: int,
+) -> None:
+    """End-to-end forward parity for the ``DeepSeekV4Flash`` model object.
+
+    Builds the model (which lazily materialises its embedding table from the
+    safetensors checkpoint), pushes a random token-id batch through
+    ``model(input_ids, attention_mask)`` on device, and compares against a CPU
+    ``torch.nn.functional.embedding`` reference using the same weight table.
+
+    The model is a stub today (``forward`` just returns the input embeddings),
+    so this exercises the object wiring + embedding path end-to-end. As more
+    submodules land, the reference should grow alongside the model.
+    """
+    model = DeepSeekV4Flash(config={}, weights_dir=DEFAULT_MODEL_DIR, device=device)
+
+    embed_weight = model.weight_loader.get_tensor("embed_tokens.weight")
+    vocab_size, hidden_size = embed_weight.shape
+    logger.info(f"embed_weight: shape={tuple(embed_weight.shape)} dtype={embed_weight.dtype}")
+
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), dtype=torch.int64)
+
+    reference_output = torch.nn.functional.embedding(input_ids, embed_weight)
+    logger.info(f"reference_output: shape={tuple(reference_output.shape)}")
+
+    tt_input_ids = ttnn.from_torch(
+        input_ids.to(torch.int32),
+        dtype=ttnn.uint32,
+        device=device,
+        layout=ttnn.ROW_MAJOR_LAYOUT,
+    )
+
+    tt_output = model(tt_input_ids, None)
+    tt_output_torch = ttnn.to_torch(tt_output).reshape(reference_output.shape).to(reference_output.dtype)
+    logger.info(f"tt_output_torch: shape={tuple(tt_output_torch.shape)}")
+
+    passing, pcc_message = comp_pcc(reference_output, tt_output_torch, pcc=PCC_THRESHOLD)
+    logger.info(comp_allclose(reference_output, tt_output_torch))
+    logger.info(f"PCC: {pcc_message}")
+
+    assert passing, f"DeepSeekV4Flash forward PCC < {PCC_THRESHOLD} (batch={batch_size}, seq={seq_len}): {pcc_message}"
