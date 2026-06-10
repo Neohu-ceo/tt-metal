@@ -1674,7 +1674,7 @@ class DeepSeekV4Model(DeepSeekV4Module):
     def _mask(
         self, seq_len: int, layer_type: str, compress_rate: Optional[int], cache: dict, device: ttnn.MeshDevice
     ) -> ttnn.Tensor:
-        key = "sliding" if layer_type == "sliding_attention" else compress_rate
+        key = f'{"sliding" if layer_type == "sliding_attention" else compress_rate}_{device.id()}'
         if key in cache:
             return cache[key]
         sliding = _sliding_causal_mask(seq_len, self.config.sliding_window)
