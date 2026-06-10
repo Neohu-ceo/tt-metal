@@ -49,8 +49,7 @@ from pathlib import Path
 import torch
 
 
-_CACHED_TRANSFORMERS = "/home/ttuser/.cache/uv/archive-v0/U5SPsIWJupLz-bDcPI13a"
-_DEFAULT_MODEL_DIR = "/home/ttuser/models/hub/models--deepseek-ai--DeepSeek-V4-Flash"
+_DEFAULT_MODEL_DIR = "/home/smanoj/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash"
 _DEFAULT_TEXT = "The capital of France is"
 
 
@@ -67,7 +66,7 @@ def _reference_main() -> None:
 
     _orig_version = _md.version
     _md.version = lambda name: "0.22.0" if name.lower() == "tokenizers" else _orig_version(name)
-    sys.path.insert(0, _CACHED_TRANSFORMERS)
+    # sys.path.insert(0, _CACHED_TRANSFORMERS)
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tt"))
 
     import weight_loader as WL  # noqa: E402
@@ -158,7 +157,7 @@ def _decode_main() -> None:
 
     _orig_version = _md.version
     _md.version = lambda name: "0.22.0" if name.lower() == "tokenizers" else _orig_version(name)
-    sys.path.insert(0, _CACHED_TRANSFORMERS)
+    # sys.path.insert(0, _CACHED_TRANSFORMERS)
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tt"))
 
     import weight_loader as WL  # noqa: E402
@@ -236,13 +235,12 @@ from models.experimental.deepseek_v4_flash.tt.weight_loader import (  # noqa: E4
 )
 
 
-_SYSTEM_PYTHON = (
-    "/usr/bin/python3" if Path("/usr/bin/python3").exists() else (shutil.which("python3") or sys.executable)
-)
+_SYSTEM_PYTHON = "/localdev/smanoj/metal_1/python_env/bin/python"
+
 _THIS_FILE = str(Path(__file__).resolve())
 _MASK_NEG = -1.0e9
 _WEIGHT_DTYPE = ttnn.bfloat4_b
-_CACHE_DIR = os.environ.get("DEEPSEEK_V4_CACHE_DIR")
+_CACHE_DIR = os.environ.get("DEEPSEEK_V4_CACHE_DIR", "../cache")
 
 
 def _checkpoint_available() -> bool:
@@ -275,8 +273,11 @@ def _block_bias(seq_len: int, n_windows: int, compress_rate: int, dtype: torch.d
 # --------------------------------------------------------------------------- #
 # Weight plumbing (reuse the loader + dequant; bf4 conversion happens on device).
 # --------------------------------------------------------------------------- #
-def _w(loader: DeepseekV4WeightLoader, name: str) -> torch.Tensor:
-    return dequantize_weight(loader.get_tensor(name), loader.get_scale(name))
+def _w(loader: DeepseekV4WeightLoader, name: str):
+    """Lazy (dequantized) fetch: returns a thunk so a populated tile cache can
+    skip the checkpoint read entirely (the module never calls the thunk on a
+    cache hit)."""
+    return lambda: dequantize_weight(loader.get_tensor(name), loader.get_scale(name))
 
 
 def _attn_keys(layer_type: str) -> list[str]:
@@ -320,9 +321,9 @@ def _build_layer_weights(loader: DeepseekV4WeightLoader, layer_idx: int, layer_t
 def _expert_provider(loader: DeepseekV4WeightLoader, layer_idx: int):
     def provider(e: int):
         base = f"layers.{layer_idx}.mlp.experts.{e}"
-        gate = _w(loader, f"{base}.gate_proj.weight")
-        up = _w(loader, f"{base}.up_proj.weight")
-        down = _w(loader, f"{base}.down_proj.weight")
+        gate = _w(loader, f"{base}.gate_proj.weight")()
+        up = _w(loader, f"{base}.up_proj.weight")()
+        down = _w(loader, f"{base}.down_proj.weight")()
         return torch.cat([gate, up], dim=0).float(), down.float()
 
     return provider

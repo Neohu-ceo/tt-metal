@@ -289,9 +289,13 @@ def _generate_reference(out_path: Path, layer_idx: int, batch: int, seq_len: int
     return out_path.is_file()
 
 
-def _w(loader: DeepseekV4WeightLoader, name: str) -> torch.Tensor:
-    """Fetch + dequantize an HF-named checkpoint tensor to fp32."""
-    return dequantize_weight(loader.get_tensor(name), loader.get_scale(name))
+def _w(loader: DeepseekV4WeightLoader, name: str):
+    """Lazy fetch + dequantize: returns a thunk producing the fp32 tensor.
+
+    Deferring the read lets a populated tile cache skip it entirely -- the
+    consuming module only calls the thunk when the converted weight is missing.
+    """
+    return lambda: dequantize_weight(loader.get_tensor(name), loader.get_scale(name))
 
 
 def _attn_keys(layer_type: str) -> list[str]:
@@ -337,9 +341,9 @@ def _expert_provider(loader: DeepseekV4WeightLoader, layer_idx: int):
 
     def provider(e: int):
         base = f"layers.{layer_idx}.mlp.experts.{e}"
-        gate = _w(loader, f"{base}.gate_proj.weight")
-        up = _w(loader, f"{base}.up_proj.weight")
-        down = _w(loader, f"{base}.down_proj.weight")
+        gate = _w(loader, f"{base}.gate_proj.weight")()
+        up = _w(loader, f"{base}.up_proj.weight")()
+        down = _w(loader, f"{base}.down_proj.weight")()
         gate_up = torch.cat([gate, up], dim=0).to(torch.bfloat16)
         return gate_up, down.to(torch.bfloat16)
 
