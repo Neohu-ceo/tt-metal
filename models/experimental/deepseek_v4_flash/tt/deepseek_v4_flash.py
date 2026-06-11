@@ -227,6 +227,81 @@ class DeepSeekV4Module:
         return self.forward(*args, **kwds)
 
 
+# ---------------------------------------------------------------------------- #
+# KV / compressor cache (decode)
+#
+# The only cross-token state in the V4-Flash stack lives in attention: the
+# hyper-connection streams, RMSNorms, the routed/shared MoE and the MLP are all
+# strictly per-token. So a single-token decode step only needs to remember, per
+# decoder layer:
+#
+#   * the rotated sliding K=V entries (shared-KV MQA, K==V), capped to the
+#     ``sliding_window`` most recent tokens, and
+#   * for CSA / HCA layers, every source token's compressor projections
+#     (``kv`` / ``gate``); the compressed long-range entries are re-pooled from
+#     these each step with the exact prefill pooling, so decode is bit-for-bit
+#     the same function of the tokens-so-far as a full prefill over them (no
+#     separate rolling-window / overlap / entry-count bookkeeping needed).
+#
+# Re-pooling the (small, ``head_dim``-wide) compressor each step is cheap next
+# to the per-token MoE / projection matmuls, which now run at ``S = 1`` instead
+# of over the whole growing context as in the repeated-prefill demo.
+# ---------------------------------------------------------------------------- #
+class _SlidingKVCache:
+    """Append-only rotated K=V cache, capped to the last ``sliding_window`` rows."""
+
+    def __init__(self, sliding_window: int):
+        self.window = sliding_window
+        self.kv: Optional[ttnn.Tensor] = None  # [B, 1, L, Dh]
+
+    def append(self, kv_new: ttnn.Tensor) -> ttnn.Tensor:
+        """Append ``kv_new`` ``[B, 1, n, Dh]`` and return the (capped) cache."""
+        self.kv = kv_new if self.kv is None else ttnn.concat([self.kv, kv_new], dim=2)
+        b, _, length, dh = self.kv.shape
+        if length > self.window:
+            self.kv = ttnn.slice(self.kv, [0, 0, length - self.window, 0], [b, 1, length, dh])
+        return self.kv
+
+
+class _CompressorCache:
+    """All source tokens' compressor ``kv`` / ``gate`` projections ``[B, T, c*Dh]``."""
+
+    def __init__(self):
+        self.kv: Optional[ttnn.Tensor] = None
+        self.gate: Optional[ttnn.Tensor] = None
+
+    def append(self, kv_new: ttnn.Tensor, gate_new: ttnn.Tensor) -> tuple[ttnn.Tensor, ttnn.Tensor]:
+        self.kv = kv_new if self.kv is None else ttnn.concat([self.kv, kv_new], dim=1)
+        self.gate = gate_new if self.gate is None else ttnn.concat([self.gate, gate_new], dim=1)
+        return self.kv, self.gate
+
+
+class _LayerKVCache:
+    """Per-decoder-layer decode state: a sliding K=V cache + optional compressor."""
+
+    def __init__(self, sliding_window: int, has_compressor: bool):
+        self.sliding = _SlidingKVCache(sliding_window)
+        self.compressor = _CompressorCache() if has_compressor else None
+
+
+def _store_compressor_projections(
+    cache: "_CompressorCache",
+    kv: ttnn.Tensor,
+    gate: ttnn.Tensor,
+    cache_len: Optional[int],
+) -> None:
+    """Append the *real* (non-padding) compressor projections to ``cache``.
+
+    ``cache_len`` slices off any tile padding so the cached projections cover
+    exactly the real tokens; decode then re-pools over a clean prefix.
+    """
+    if cache_len is not None and cache_len != kv.shape[1]:
+        feat = kv.shape[2]
+        kv = ttnn.slice(kv, [0, 0, 0], [kv.shape[0], cache_len, feat])
+        gate = ttnn.slice(gate, [0, 0, 0], [gate.shape[0], cache_len, feat])
+    cache.append(kv, gate)
+
+
 def _interleaved_rotate_matrix(rope_dim: int) -> torch.Tensor:
     """Fixed ``[Rd, Rd]`` matrix ``R`` s.t. ``x @ R == rotate_half(x)``.
 
@@ -450,16 +525,27 @@ class DeepSeekV4HCACompressor:
             cache_file_name=cache.file("compressor.position_bias"),
         )
 
-    def __call__(self, hidden: ttnn.Tensor, cos_win: ttnn.Tensor, sin_win: ttnn.Tensor) -> ttnn.Tensor | None:
-        b, s, _ = hidden.shape
+    def _project(self, hidden: ttnn.Tensor) -> tuple[ttnn.Tensor, ttnn.Tensor]:
+        """``hidden`` ``[B, S, D]`` -> per-token ``(kv, gate)`` ``[B, S, Dh]`` each."""
+        return self.kv_proj(hidden), self.gate_proj(hidden)
+
+    def _pool(
+        self, kv: ttnn.Tensor, gate: ttnn.Tensor, cos_win: ttnn.Tensor, sin_win: ttnn.Tensor
+    ) -> ttnn.Tensor | None:
+        """Pool the projected ``(kv, gate)`` ``[B, T, Dh]`` into compressed entries.
+
+        Compresses every complete window of ``compress_rate`` tokens into one
+        softmax-gated entry and RoPEs it at its window position. Shared by prefill
+        (``__call__``) and decode so the two stay numerically identical.
+        """
+        b = kv.shape[0]
+        t = kv.shape[1]
         cr = self.compress_rate
-        n_win = s // cr
+        n_win = t // cr
         if n_win == 0:
             return None
         usable = n_win * cr
-        kv = self.kv_proj(hidden)
-        gate = self.gate_proj(hidden)
-        if usable != s:
+        if usable != t:
             kv = ttnn.slice(kv, [0, 0, 0], [b, usable, self.head_dim])
             gate = ttnn.slice(gate, [0, 0, 0], [b, usable, self.head_dim])
         kv = ttnn.reshape(kv, [b, n_win, cr, self.head_dim])
@@ -468,8 +554,32 @@ class DeepSeekV4HCACompressor:
         compressed = _softmax_weighted_sum(kv, gate, window_axis=2)  # [B, n_win, Dh]
         compressed = self.kv_norm(compressed)
         compressed = ttnn.reshape(compressed, [b, 1, n_win, self.head_dim])
-        compressed = _apply_rope(compressed, cos_win, sin_win, self.rot, self.rope_dim)
-        return compressed
+        return _apply_rope(compressed, cos_win, sin_win, self.rot, self.rope_dim)
+
+    def __call__(
+        self,
+        hidden: ttnn.Tensor,
+        cos_win: ttnn.Tensor,
+        sin_win: ttnn.Tensor,
+        cache: Optional["_CompressorCache"] = None,
+        cache_len: Optional[int] = None,
+    ) -> ttnn.Tensor | None:
+        kv, gate = self._project(hidden)
+        if cache is not None:
+            _store_compressor_projections(cache, kv, gate, cache_len)
+        return self._pool(kv, gate, cos_win, sin_win)
+
+    def decode(
+        self, hidden: ttnn.Tensor, cos_win: ttnn.Tensor, sin_win: ttnn.Tensor, cache: "_CompressorCache"
+    ) -> ttnn.Tensor | None:
+        """Project the new token(s), append to ``cache``, re-pool all entries.
+
+        ``cos_win`` / ``sin_win`` must cover every window emittable from the full
+        cached projection length (``n_win`` rows); the caller slices them.
+        """
+        kv, gate = self._project(hidden)
+        kv_all, gate_all = cache.append(kv, gate)
+        return self._pool(kv_all, gate_all, cos_win, sin_win)
 
 
 class DeepSeekV4CSACompressor:
@@ -522,17 +632,24 @@ class DeepSeekV4CSACompressor:
             cache_file_name=cache.file("compressor.position_bias"),
         )
 
-    def __call__(self, hidden: ttnn.Tensor, cos_win: ttnn.Tensor, sin_win: ttnn.Tensor) -> ttnn.Tensor | None:
-        b, s, _ = hidden.shape
+    def _project(self, hidden: ttnn.Tensor) -> tuple[ttnn.Tensor, ttnn.Tensor]:
+        """``hidden`` ``[B, S, D]`` -> per-token ``(kv, gate)`` ``[B, S, 2*Dh]`` each."""
+        return self.kv_proj(hidden), self.gate_proj(hidden)
+
+    def _pool(
+        self, kv: ttnn.Tensor, gate: ttnn.Tensor, cos_win: ttnn.Tensor, sin_win: ttnn.Tensor
+    ) -> ttnn.Tensor | None:
+        """Pool the projected ``(kv, gate)`` ``[B, T, 2*Dh]`` into compressed entries
+        (two-series Ca/Cb overlap). Shared by prefill and decode."""
+        b = kv.shape[0]
+        t = kv.shape[1]
         cr = self.compress_rate
         dh = self.head_dim
-        n_win = s // cr
+        n_win = t // cr
         if n_win == 0:
             return None
         usable = n_win * cr
-        kv = self.kv_proj(hidden)  # [B, S, 2*Dh]
-        gate = self.gate_proj(hidden)
-        if usable != s:
+        if usable != t:
             kv = ttnn.slice(kv, [0, 0, 0], [b, usable, 2 * dh])
             gate = ttnn.slice(gate, [0, 0, 0], [b, usable, 2 * dh])
         kv = ttnn.reshape(kv, [b, n_win, cr, 2 * dh])
@@ -560,8 +677,27 @@ class DeepSeekV4CSACompressor:
         compressed = _softmax_weighted_sum(new_kv, new_gate, window_axis=2)  # [B, n_win, Dh]
         compressed = self.kv_norm(compressed)
         compressed = ttnn.reshape(compressed, [b, 1, n_win, dh])
-        compressed = _apply_rope(compressed, cos_win, sin_win, self.rot, self.rope_dim)
-        return compressed
+        return _apply_rope(compressed, cos_win, sin_win, self.rot, self.rope_dim)
+
+    def __call__(
+        self,
+        hidden: ttnn.Tensor,
+        cos_win: ttnn.Tensor,
+        sin_win: ttnn.Tensor,
+        cache: Optional["_CompressorCache"] = None,
+        cache_len: Optional[int] = None,
+    ) -> ttnn.Tensor | None:
+        kv, gate = self._project(hidden)
+        if cache is not None:
+            _store_compressor_projections(cache, kv, gate, cache_len)
+        return self._pool(kv, gate, cos_win, sin_win)
+
+    def decode(
+        self, hidden: ttnn.Tensor, cos_win: ttnn.Tensor, sin_win: ttnn.Tensor, cache: "_CompressorCache"
+    ) -> ttnn.Tensor | None:
+        kv, gate = self._project(hidden)
+        kv_all, gate_all = cache.append(kv, gate)
+        return self._pool(kv_all, gate_all, cos_win, sin_win)
 
 
 _COMPRESSORS = {
@@ -680,28 +816,11 @@ class DeepSeekV4Attention(DeepSeekV4Module):
         y = ttnn.reshape(y, [b, s, self.o_groups * self.o_lora_rank])
         return self.o_b_proj(y)
 
-    def forward(
-        self,
-        hidden: ttnn.Tensor,
-        cos: ttnn.Tensor,
-        sin: ttnn.Tensor,
-        neg_sin: ttnn.Tensor,
-        mask: ttnn.Tensor,
-        cos_win: ttnn.Tensor | None = None,
-        sin_win: ttnn.Tensor | None = None,
-    ) -> ttnn.Tensor:
-        """Prefill attention.
+    def _qkv(self, hidden: ttnn.Tensor, cos: ttnn.Tensor, sin: ttnn.Tensor) -> tuple[ttnn.Tensor, ttnn.Tensor]:
+        """Project + RoPE the query and (shared) K=V for ``hidden`` ``[B, S, D]``.
 
-        Args:
-            hidden: ``[B, S, hidden_size]`` input.
-            cos/sin: ``[1,1,S,Rd]`` RoPE tables for this layer's rope type, at the
-                query positions (used for Q, KV, and the output conjugate rotation).
-            neg_sin: ``-sin`` table for the output conjugate (``-i``) rotation.
-            mask: ``[B,1,S,Skv]`` additive attention mask. ``Skv == S`` for sliding
-                layers; ``S + n_windows`` for CSA/HCA (sliding-causal cols followed
-                by the compressed-window block_bias cols).
-            cos_win/sin_win: ``[1,1,n_windows,Rd]`` RoPE tables at the compressor's
-                window positions (required for CSA/HCA layers).
+        Returns ``q`` ``[B, H, S, Dh]`` and the rotated ``kv`` ``[B, 1, S, Dh]``
+        (pre-compressor, pre-cache). Shared by prefill and decode.
         """
         b, s, _ = hidden.shape
         h, dh = self.num_heads, self.head_dim
@@ -717,9 +836,50 @@ class DeepSeekV4Attention(DeepSeekV4Module):
         kv = ttnn.reshape(kv, [b, s, 1, dh])
         kv = ttnn.transpose(kv, 1, 2)  # [B, 1, S, Dh]
         kv = _apply_rope(kv, cos, sin, self.rot, self.rope_dim)
+        return q, kv
+
+    def forward(
+        self,
+        hidden: ttnn.Tensor,
+        cos: ttnn.Tensor,
+        sin: ttnn.Tensor,
+        neg_sin: ttnn.Tensor,
+        mask: ttnn.Tensor,
+        cos_win: ttnn.Tensor | None = None,
+        sin_win: ttnn.Tensor | None = None,
+        kv_cache: Optional["_LayerKVCache"] = None,
+        cache_len: Optional[int] = None,
+    ) -> ttnn.Tensor:
+        """Prefill attention.
+
+        Args:
+            hidden: ``[B, S, hidden_size]`` input.
+            cos/sin: ``[1,1,S,Rd]`` RoPE tables for this layer's rope type, at the
+                query positions (used for Q, KV, and the output conjugate rotation).
+            neg_sin: ``-sin`` table for the output conjugate (``-i``) rotation.
+            mask: ``[B,1,S,Skv]`` additive attention mask. ``Skv == S`` for sliding
+                layers; ``S + n_windows`` for CSA/HCA (sliding-causal cols followed
+                by the compressed-window block_bias cols).
+            cos_win/sin_win: ``[1,1,n_windows,Rd]`` RoPE tables at the compressor's
+                window positions (required for CSA/HCA layers).
+            kv_cache: if given, populate it for a subsequent decode (the rotated
+                sliding K=V capped to the window, plus the compressor projections).
+            cache_len: number of *real* (non-padding) tokens in ``hidden``; the
+                cache stores only this prefix.
+        """
+        b, s, _ = hidden.shape
+        dh = self.head_dim
+
+        q, kv = self._qkv(hidden, cos, sin)
+
+        if kv_cache is not None:
+            real = s if cache_len is None else cache_len
+            kv_real = kv if real == s else ttnn.slice(kv, [0, 0, 0, 0], [b, 1, real, dh])
+            kv_cache.sliding.append(kv_real)
 
         if self.compressor is not None:
-            compressed = self.compressor(hidden, cos_win, sin_win)
+            comp_cache = kv_cache.compressor if kv_cache is not None else None
+            compressed = self.compressor(hidden, cos_win, sin_win, cache=comp_cache, cache_len=cache_len)
             if compressed is not None:
                 kv = ttnn.concat([kv, compressed], dim=2)  # [B, 1, S + n_win, Dh]
 
@@ -729,6 +889,45 @@ class DeepSeekV4Attention(DeepSeekV4Module):
         attn = _apply_rope(attn, cos, neg_sin, self.rot, self.rope_dim)
         attn = ttnn.transpose(attn, 1, 2)  # [B, S, H, Dh]
 
+        return self._grouped_output(attn)
+
+    def decode(
+        self,
+        hidden: ttnn.Tensor,
+        cos: ttnn.Tensor,
+        sin: ttnn.Tensor,
+        neg_sin: ttnn.Tensor,
+        cos_win: ttnn.Tensor | None,
+        sin_win: ttnn.Tensor | None,
+        kv_cache: "_LayerKVCache",
+    ) -> ttnn.Tensor:
+        """Single-token decode attention against the running ``kv_cache``.
+
+        ``hidden`` is ``[B, 1, D]`` (the new token); ``cos`` / ``sin`` / ``neg_sin``
+        are the single RoPE rows ``[1,1,1,Rd]`` at this token's absolute position;
+        ``cos_win`` / ``sin_win`` cover every currently-emittable compressor window.
+
+        The mask is implicitly zero: a single causal query at the front of its
+        (window-capped) cache sees every cached sliding key and every existing
+        compressed entry, so no additive masking is needed (valid while the
+        sequence stays within ``index_topk * compress_rate``, matching the
+        prefill port's degenerate-indexer assumption).
+        """
+        b, s, _ = hidden.shape  # s == 1
+
+        q, kv_new = self._qkv(hidden, cos, sin)  # q [B,H,1,Dh], kv_new [B,1,1,Dh]
+        kv = kv_cache.sliding.append(kv_new)  # [B, 1, L_sld, Dh]
+
+        if self.compressor is not None:
+            compressed = self.compressor.decode(hidden, cos_win, sin_win, kv_cache.compressor)
+            if compressed is not None:
+                kv = ttnn.concat([kv, compressed], dim=2)  # [B, 1, L_sld + n_win, Dh]
+
+        mask = ttnn.zeros([1, 1, s, kv.shape[2]], ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device)
+        attn = self._attention(q, kv, mask)  # [B, H, 1, Dh]
+
+        attn = _apply_rope(attn, cos, neg_sin, self.rot, self.rope_dim)
+        attn = ttnn.transpose(attn, 1, 2)  # [B, 1, H, Dh]
         return self._grouped_output(attn)
 
 
@@ -1370,12 +1569,52 @@ class DeepSeekV4DecoderLayer(DeepSeekV4Module):
         cos_win: ttnn.Tensor | None = None,
         sin_win: ttnn.Tensor | None = None,
         input_ids: Optional[torch.Tensor] = None,
+        kv_cache: Optional["_LayerKVCache"] = None,
+        cache_len: Optional[int] = None,
     ) -> ttnn.Tensor:
-        """``hidden_streams`` ``[B, S, hc_mult, D]`` -> updated streams ``[B, S, hc_mult, D]``."""
+        """``hidden_streams`` ``[B, S, hc_mult, D]`` -> updated streams ``[B, S, hc_mult, D]``.
+
+        If ``kv_cache`` is given the attention populates it (sliding K=V + compressor
+        projections) for a subsequent :meth:`decode`; ``cache_len`` is the real
+        (non-padding) token count.
+        """
         post, comb, collapsed = self.attn_hc(hidden_streams)
         attn_out = self.self_attn(
-            self.input_layernorm(collapsed), cos, sin, neg_sin, mask, cos_win=cos_win, sin_win=sin_win
+            self.input_layernorm(collapsed),
+            cos,
+            sin,
+            neg_sin,
+            mask,
+            cos_win=cos_win,
+            sin_win=sin_win,
+            kv_cache=kv_cache,
+            cache_len=cache_len,
         )
+        hidden_streams = self._mix(post, comb, attn_out, hidden_streams)
+
+        post, comb, collapsed = self.ffn_hc(hidden_streams)
+        mlp_out = self.mlp(self.post_attention_layernorm(collapsed), input_ids=input_ids)
+        return self._mix(post, comb, mlp_out, hidden_streams)
+
+    def decode(
+        self,
+        hidden_streams: ttnn.Tensor,
+        cos: ttnn.Tensor,
+        sin: ttnn.Tensor,
+        neg_sin: ttnn.Tensor,
+        cos_win: ttnn.Tensor | None,
+        sin_win: ttnn.Tensor | None,
+        kv_cache: "_LayerKVCache",
+        input_ids: Optional[torch.Tensor] = None,
+    ) -> ttnn.Tensor:
+        """Single-token decode: ``hidden_streams`` ``[B, 1, hc_mult, D]`` -> same.
+
+        Everything outside attention (hyper-connections, norms, MoE / MLP) is
+        per-token, so this is the prefill block with ``S = 1`` and the cached
+        attention substituted for the full-sequence attention.
+        """
+        post, comb, collapsed = self.attn_hc(hidden_streams)
+        attn_out = self.self_attn.decode(self.input_layernorm(collapsed), cos, sin, neg_sin, cos_win, sin_win, kv_cache)
         hidden_streams = self._mix(post, comb, attn_out, hidden_streams)
 
         post, comb, collapsed = self.ffn_hc(hidden_streams)
@@ -1567,6 +1806,17 @@ class DeepSeekV4Model(DeepSeekV4Module):
                 )
             )
 
+        # The head (hc_head / norm / external lm_head) must live where the *last*
+        # decoder layer's output lands, not unconditionally on the final submesh —
+        # otherwise a capped (``max_layers``) stack would end on a lower submesh
+        # than the head and mismatch devices.
+        if self.layer_devices:
+            self.last_device = self.layer_devices[-1]
+
+        # Per-layer decode state (sliding K=V + optional compressor projections).
+        self.sliding_window = config.sliding_window
+        self.kv_caches: list[_LayerKVCache] = self._new_caches()
+
         self.hc_head = DeepSeekV4HyperHead(
             config,
             {
@@ -1646,6 +1896,17 @@ class DeepSeekV4Model(DeepSeekV4Module):
             this_device = self.first_device
         return DeepSeekV4HashRouter(self.config, weights, this_device)
 
+    # -- decode KV-cache state -------------------------------------------------- #
+    def _new_caches(self) -> list["_LayerKVCache"]:
+        return [
+            _LayerKVCache(self.sliding_window, self.config.layer_types[li] != "sliding_attention")
+            for li in range(self.num_layers)
+        ]
+
+    def reset_caches(self) -> None:
+        """Drop all per-layer decode state (call before a fresh prefill)."""
+        self.kv_caches = self._new_caches()
+
     # -- per-layer RoPE tables / masks ------------------------------------------ #
     def _to_tt(self, t: torch.Tensor, device: ttnn.MeshDevice) -> ttnn.Tensor:
         return ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
@@ -1687,8 +1948,62 @@ class DeepSeekV4Model(DeepSeekV4Module):
         cache[key] = mask_tt
         return mask_tt
 
-    def forward(self, input_ids: torch.Tensor, rope: dict) -> ttnn.Tensor:
-        """``input_ids`` torch ``[B, S]`` + host ``rope`` bundle -> ``[B, S, hidden]``."""
+    def _rope_rows_decode(
+        self, rope: dict, pos: int, layer_type: str, compress_rate: Optional[int], cache: dict, device: ttnn.MeshDevice
+    ):
+        """Single-position RoPE rows for a decode step.
+
+        Returns ``(cos, sin, neg_sin, cos_win, sin_win)`` where ``cos/sin/neg_sin``
+        are the one ``[1,1,1,Rd]`` rows at absolute position ``pos`` and the window
+        tables cover the ``(pos + 1) // compress_rate`` currently-emittable windows
+        (``None`` when none / a sliding layer).
+        """
+        key = f'{"sliding" if layer_type == "sliding_attention" else compress_rate}_{device.id()}'
+        if key in cache:
+            return cache[key]
+        cos_h, sin_h = rope["main"] if layer_type == "sliding_attention" else rope["compress"]
+        cos_row, sin_row = cos_h[pos : pos + 1], sin_h[pos : pos + 1]
+        cos_full, sin_full = make_rope_table(cos_row, sin_row)
+        cos_tt = self._to_tt(cos_full, device)
+        sin_tt = self._to_tt(sin_full, device)
+        neg_sin_tt = self._to_tt(-sin_full, device)
+
+        cos_win_tt = sin_win_tt = None
+        if layer_type != "sliding_attention":
+            n_win = (pos + 1) // compress_rate
+            if n_win > 0:
+                cw_h, sw_h = rope["win"][compress_rate]
+                cw, sw = make_rope_table(cw_h[:n_win], sw_h[:n_win])
+                cos_win_tt = self._to_tt(cw, device)
+                sin_win_tt = self._to_tt(sw, device)
+        out = (cos_tt, sin_tt, neg_sin_tt, cos_win_tt, sin_win_tt)
+        cache[key] = out
+        return out
+
+    def _copy_streams_between_submeshes_host(self, streams, from_submesh_id: int, to_submesh_id: int):
+        """Move ``streams`` between submeshes via a host round-trip.
+
+        A device-independent fallback to the socket path (:meth:`_copy_hidden_states_between_submeshes`)
+        for the tiny single-token decode stream, where host transfer latency is
+        negligible and we avoid depending on socket setup.
+        """
+        host = ttnn.to_torch(streams)
+        streams.deallocate(True)
+        return ttnn.from_torch(host, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.submeshes[to_submesh_id])
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        rope: dict,
+        populate_cache: bool = False,
+        cache_len: Optional[int] = None,
+    ) -> ttnn.Tensor:
+        """``input_ids`` torch ``[B, S]`` + host ``rope`` bundle -> ``[B, S, hidden]``.
+
+        ``populate_cache`` runs this prefill as the seed for a subsequent
+        :meth:`decode`: each layer fills its :class:`_LayerKVCache` from the first
+        ``cache_len`` (real, non-padding) tokens. Call :meth:`reset_caches` first.
+        """
         seq_len = input_ids.shape[1]
         ids_tt = ttnn.from_torch(
             input_ids.to(torch.int32), dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.first_device
@@ -1727,6 +2042,59 @@ class DeepSeekV4Model(DeepSeekV4Module):
                 cos_win=cos_win_tt,
                 sin_win=sin_win_tt,
                 input_ids=input_ids,
+                kv_cache=self.kv_caches[li] if populate_cache else None,
+                cache_len=cache_len,
+            )
+            last_submesh_id = current_submesh_id
+
+        return self.norm(self.hc_head(streams))
+
+    def prefill(self, input_ids: torch.Tensor, rope: dict, cache_len: Optional[int] = None) -> ttnn.Tensor:
+        """Prefill that seeds the decode KV cache. ``input_ids`` ``[B, S]`` (tile-padded);
+        ``cache_len`` is the real token count (defaults to ``S``)."""
+        self.reset_caches()
+        return self.forward(input_ids, rope, populate_cache=True, cache_len=cache_len)
+
+    def decode(self, token_id: int, pos: int, rope: dict) -> ttnn.Tensor:
+        """Generate one step: feed ``token_id`` at absolute position ``pos`` against
+        the running KV cache; returns ``[B, 1, hidden]`` (apply ``lm_head`` for logits).
+
+        ``rope`` is the *full* (max-length) host bundle; the needed rows are sliced
+        per layer. Requires a prior :meth:`prefill` (the cache holds positions
+        ``0 .. pos - 1``)."""
+        ids = torch.tensor([[token_id]], dtype=torch.long)
+        ids_tt = ttnn.from_torch(
+            ids.to(torch.int32), dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.first_device
+        )
+        inputs_embeds = self.embed_tokens(ids_tt)  # [B, 1, D]
+        b, s, d = inputs_embeds.shape
+        streams = ttnn.reshape(inputs_embeds, [b, s, 1, d])
+        streams = ttnn.repeat(streams, ttnn.Shape([1, 1, self.config.hc_mult, 1]))  # [B, 1, hc_mult, D]
+
+        rope_cache: dict = {}
+        last_submesh_id = 0
+        for li, layer in enumerate(self.layers):
+            if self.use_submeshes:
+                current_submesh_id = li // self.layers_per_device
+                if current_submesh_id != last_submesh_id:
+                    streams = self._copy_streams_between_submeshes_host(streams, last_submesh_id, current_submesh_id)
+                this_device = self.submeshes[current_submesh_id]
+            else:
+                this_device = self.first_device
+            layer_type = self.config.layer_types[li]
+            compress_rate = None if layer_type == "sliding_attention" else self.config.compress_rates[layer_type]
+            cos_tt, sin_tt, neg_sin_tt, cos_win_tt, sin_win_tt = self._rope_rows_decode(
+                rope, pos, layer_type, compress_rate, rope_cache, this_device
+            )
+            streams = layer.decode(
+                streams,
+                cos_tt,
+                sin_tt,
+                neg_sin_tt,
+                cos_win_tt,
+                sin_win_tt,
+                self.kv_caches[li],
+                input_ids=ids,
             )
             last_submesh_id = current_submesh_id
 
