@@ -23,8 +23,10 @@ struct ProgramRealtimeRecord {
                                                        // MetalContext teardown or reinitialization.
 };
 
-// Callback type for real-time profiler data.
-using ProgramRealtimeProfilerCallback = std::function<void(const ProgramRealtimeRecord& record)>;
+// Callback type for real-time profiler data. Invoked with a batch of records (oldest first) so a
+// consumer can amortize fixed costs (a lock, a file flush, a network/DB round-trip, etc.) across multiple records. The
+// span is valid only for the duration of the call.
+using ProgramRealtimeProfilerCallback = std::function<void(std::span<const ProgramRealtimeRecord> records)>;
 
 // Opaque handle returned by RegisterProgramRealtimeProfilerCallback, used to unregister.
 using ProgramRealtimeProfilerCallbackHandle = uint64_t;

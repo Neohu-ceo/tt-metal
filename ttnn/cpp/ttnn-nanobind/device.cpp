@@ -665,9 +665,11 @@ void device_module(nb::module_& m_device) {
             Py_INCREF(raw_cb);
 
             auto handle = tt::tt_metal::experimental::RegisterProgramRealtimeProfilerCallback(
-                [raw_cb](const tt::tt_metal::experimental::ProgramRealtimeRecord& record) {
+                [raw_cb](std::span<const tt::tt_metal::experimental::ProgramRealtimeRecord> records) {
                     nb::gil_scoped_acquire gil;
-                    (nb::handle(raw_cb))(nb::cast(record, nb::rv_policy::copy));
+                    for (const auto& record : records) {
+                        (nb::handle(raw_cb))(nb::cast(record, nb::rv_policy::copy));
+                    }
                 });
 
             python_realtime_callback_refs[handle] = raw_cb;

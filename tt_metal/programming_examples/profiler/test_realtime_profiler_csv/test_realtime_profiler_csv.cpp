@@ -31,40 +31,7 @@ static std::mutex g_csv_mutex;
 static std::ofstream g_csv_file;
 static bool g_csv_header_written = false;
 
-static void WriteRealtimeRecordToCsv(const tt::tt_metal::experimental::ProgramRealtimeRecord& record) {
-    uint64_t duration_cycles =
-        (record.end_timestamp >= record.start_timestamp) ? (record.end_timestamp - record.start_timestamp) : 0;
-    double duration_ns = (record.frequency > 0.0) ? (static_cast<double>(duration_cycles) / record.frequency) : 0.0;
-
-    fmt::print(
-        "realtime record: id={} chip_id={} start={} end={} duration_cycles={} duration_ns={:.2f}\n",
-        record.runtime_id,
-        record.chip_id,
-        record.start_timestamp,
-        record.end_timestamp,
-        duration_cycles,
-        duration_ns);
-
-    std::string kernel_sources_str;
-    for (size_t i = 0; i < record.kernel_sources.size(); i++) {
-        if (i > 0) {
-            kernel_sources_str += ";";
-        }
-        kernel_sources_str += record.kernel_sources[i];
-    }
-    // Escape quotes in kernel_sources for CSV
-    std::string escaped;
-    escaped.reserve(kernel_sources_str.size() + 2);
-    escaped += '"';
-    for (char c : kernel_sources_str) {
-        if (c == '"') {
-            escaped += "\"\"";
-        } else {
-            escaped += c;
-        }
-    }
-    escaped += '"';
-
+static void WriteRealtimeRecordsToCsv(std::span<const tt::tt_metal::experimental::ProgramRealtimeRecord> records) {
     std::lock_guard<std::mutex> lock(g_csv_mutex);
     if (!g_csv_file.is_open()) {
         return;
@@ -75,9 +42,45 @@ static void WriteRealtimeRecordToCsv(const tt::tt_metal::experimental::ProgramRe
                    << "kernel_sources\n";
         g_csv_header_written = true;
     }
-    g_csv_file << record.runtime_id << "," << record.chip_id << "," << record.start_timestamp << ","
-               << record.end_timestamp << "," << duration_cycles << "," << duration_ns << "," << record.frequency << ","
-               << escaped << "\n";
+
+    for (const auto& record : records) {
+        uint64_t duration_cycles =
+            (record.end_timestamp >= record.start_timestamp) ? (record.end_timestamp - record.start_timestamp) : 0;
+        double duration_ns = (record.frequency > 0.0) ? (static_cast<double>(duration_cycles) / record.frequency) : 0.0;
+
+        fmt::print(
+            "realtime record: id={} chip_id={} start={} end={} duration_cycles={} duration_ns={:.2f}\n",
+            record.runtime_id,
+            record.chip_id,
+            record.start_timestamp,
+            record.end_timestamp,
+            duration_cycles,
+            duration_ns);
+
+        std::string kernel_sources_str;
+        for (size_t i = 0; i < record.kernel_sources.size(); i++) {
+            if (i > 0) {
+                kernel_sources_str += ";";
+            }
+            kernel_sources_str += record.kernel_sources[i];
+        }
+        // Escape quotes in kernel_sources for CSV
+        std::string escaped;
+        escaped.reserve(kernel_sources_str.size() + 2);
+        escaped += '"';
+        for (char c : kernel_sources_str) {
+            if (c == '"') {
+                escaped += "\"\"";
+            } else {
+                escaped += c;
+            }
+        }
+        escaped += '"';
+
+        g_csv_file << record.runtime_id << "," << record.chip_id << "," << record.start_timestamp << ","
+                   << record.end_timestamp << "," << duration_cycles << "," << duration_ns << "," << record.frequency
+                   << "," << escaped << "\n";
+    }
     g_csv_file.flush();
 }
 
@@ -133,10 +136,7 @@ int main(int argc, char** argv) {
         }
 
         tt::tt_metal::experimental::ProgramRealtimeProfilerCallbackHandle callback_handle =
-            tt::tt_metal::experimental::RegisterProgramRealtimeProfilerCallback(
-                [](const tt::tt_metal::experimental::ProgramRealtimeRecord& record) {
-                    WriteRealtimeRecordToCsv(record);
-                });
+            tt::tt_metal::experimental::RegisterProgramRealtimeProfilerCallback(WriteRealtimeRecordsToCsv);
 
         RunPrograms(mesh_device, num_programs);
         mesh_device->quiesce_devices();

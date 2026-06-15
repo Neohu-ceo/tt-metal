@@ -235,11 +235,12 @@ void DataCollector::InvokeProgramRealtimeProfilerCallbacks(const tt::ProgramReal
         }
     }
 
+    const std::span<const tt::ProgramRealtimeRecord> records(&record, 1);
     std::exception_ptr callback_exception;
     for (const auto& [callback, state] : active_callbacks) {
         (void)state;
         try {
-            callback(record);
+            callback(records);
         } catch (...) {
             if (!callback_exception) {
                 callback_exception = std::current_exception();

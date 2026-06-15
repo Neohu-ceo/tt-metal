@@ -178,10 +178,10 @@ TEST(RealtimeProfilerStress, RingBufferOverflowFromTrace) {
     std::vector<ProgramRealtimeRecord> records;
     records.reserve(kNumProgramsInTrace);
 
-    ProgramRealtimeProfilerCallbackHandle handle =
-        RegisterProgramRealtimeProfilerCallback([&records_mu, &records](const ProgramRealtimeRecord& record) {
+    ProgramRealtimeProfilerCallbackHandle handle = RegisterProgramRealtimeProfilerCallback(
+        [&records_mu, &records](std::span<const ProgramRealtimeRecord> incoming) {
             std::lock_guard<std::mutex> lk(records_mu);
-            records.push_back(record);
+            records.insert(records.end(), incoming.begin(), incoming.end());
         });
 
     distributed::MeshWorkload workload = build_blank_kernel_workload(mesh_device);
@@ -347,8 +347,10 @@ TEST(RealtimeProfilerStress, HostFifoPressureSustained) {
     }
 
     std::atomic<uint64_t> record_count{0};
-    ProgramRealtimeProfilerCallbackHandle handle = RegisterProgramRealtimeProfilerCallback(
-        [&record_count](const ProgramRealtimeRecord&) { record_count.fetch_add(1, std::memory_order_relaxed); });
+    ProgramRealtimeProfilerCallbackHandle handle =
+        RegisterProgramRealtimeProfilerCallback([&record_count](std::span<const ProgramRealtimeRecord> records) {
+            record_count.fetch_add(records.size(), std::memory_order_relaxed);
+        });
 
     distributed::MeshWorkload workload = build_blank_kernel_workload(mesh_device);
     auto& cq = mesh_device->mesh_command_queue(0);
