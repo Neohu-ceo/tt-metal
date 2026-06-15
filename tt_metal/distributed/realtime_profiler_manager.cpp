@@ -74,8 +74,9 @@ constexpr uint32_t REALTIME_PROFILER_SYNC_MARKER_ID = 0xFFFFFFFF;
 // Real-time profiler runtime constants. On-device L1 layout sizes are reused from
 // realtime_profiler_ring_buffer.hpp so host and device share a single source of truth.
 struct RealtimeProfilerRuntimeSizes {
-    static constexpr uint32_t fifo_size = 4096;                    // 4KB pinned-host FIFO for D2H socket
+    static constexpr uint32_t fifo_pages = 32768;                  // host D2H FIFO depth, in pages
     static constexpr uint32_t page_size = RT_PROFILER_ENTRY_SIZE;  // host page size == ring entry size
+    static constexpr uint32_t fifo_size = fifo_pages * page_size;  // pinned-host FIFO, in bytes (2 MiB)
     static constexpr uint32_t core_l1_size = sizeof(RealtimeProfilerCoreL1);
 };
 
@@ -329,6 +330,68 @@ RealtimeProfilerManager::DeviceState::DeviceState(DeviceState&& o) noexcept :
     sync_host_time_before(o.sync_host_time_before),
     last_finish_sync_at(o.last_finish_sync_at),
     pending_first_unthrottled_finish_sync(o.pending_first_unthrottled_finish_sync) {}
+
+namespace {
+// Sampled by the receiver thread; relaxed atomics so sampling adds negligible overhead to the
+// receiver path it measures. Windowed stats are the cumulative moments minus their value at the
+// previous read.
+std::atomic<uint32_t> g_rtp_fifo_max_all{0};
+std::atomic<uint32_t> g_rtp_fifo_max_window{0};
+std::atomic<uint64_t> g_rtp_fifo_samples_all{0};
+std::atomic<uint64_t> g_rtp_fifo_sum_all{0};
+std::atomic<uint64_t> g_rtp_fifo_sum_sq_all{0};
+std::atomic<uint64_t> g_rtp_fifo_samples_at_last_read{0};
+std::atomic<uint64_t> g_rtp_fifo_sum_at_last_read{0};
+std::atomic<uint64_t> g_rtp_fifo_sum_sq_at_last_read{0};
+
+void rtp_atomic_max(std::atomic<uint32_t>& slot, uint32_t value) {
+    uint32_t cur = slot.load(std::memory_order_relaxed);
+    while (value > cur && !slot.compare_exchange_weak(cur, value, std::memory_order_relaxed)) {
+    }
+}
+
+// Pooled mean + stddev from summed moments; both 0 when n == 0.
+void rtp_moments(uint64_t n, uint64_t sum, uint64_t sum_sq, double& mean_out, double& stddev_out) {
+    if (n == 0) {
+        mean_out = 0.0;
+        stddev_out = 0.0;
+        return;
+    }
+    const double mean = static_cast<double>(sum) / static_cast<double>(n);
+    const double variance = static_cast<double>(sum_sq) / static_cast<double>(n) - mean * mean;
+    mean_out = mean;
+    stddev_out = variance > 0.0 ? std::sqrt(variance) : 0.0;
+}
+}  // namespace
+
+void RealtimeProfilerManager::record_fifo_sample(uint32_t occupied_pages) {
+    const uint64_t v = occupied_pages;
+    rtp_atomic_max(g_rtp_fifo_max_all, occupied_pages);
+    rtp_atomic_max(g_rtp_fifo_max_window, occupied_pages);
+    g_rtp_fifo_samples_all.fetch_add(1, std::memory_order_relaxed);
+    g_rtp_fifo_sum_all.fetch_add(v, std::memory_order_relaxed);
+    g_rtp_fifo_sum_sq_all.fetch_add(v * v, std::memory_order_relaxed);
+}
+
+RealtimeProfilerManager::FifoPressure RealtimeProfilerManager::read_fifo_pressure() {
+    FifoPressure p;
+    const uint64_t n_all = g_rtp_fifo_samples_all.load(std::memory_order_relaxed);
+    const uint64_t sum_all = g_rtp_fifo_sum_all.load(std::memory_order_relaxed);
+    const uint64_t sum_sq_all = g_rtp_fifo_sum_sq_all.load(std::memory_order_relaxed);
+    p.all_time_samples = n_all;
+    p.all_time_max_pages = g_rtp_fifo_max_all.load(std::memory_order_relaxed);
+    rtp_moments(n_all, sum_all, sum_sq_all, p.all_time_mean_pages, p.all_time_stddev_pages);
+    // Single reader only: concurrent reads would split the window between them.
+    const uint64_t n_win = n_all - g_rtp_fifo_samples_at_last_read.exchange(n_all, std::memory_order_relaxed);
+    const uint64_t sum_win = sum_all - g_rtp_fifo_sum_at_last_read.exchange(sum_all, std::memory_order_relaxed);
+    const uint64_t sum_sq_win =
+        sum_sq_all - g_rtp_fifo_sum_sq_at_last_read.exchange(sum_sq_all, std::memory_order_relaxed);
+    p.window_samples = n_win;
+    p.window_max_pages = g_rtp_fifo_max_window.exchange(0, std::memory_order_relaxed);
+    rtp_moments(n_win, sum_win, sum_sq_win, p.window_mean_pages, p.window_stddev_pages);
+    p.capacity_pages = RealtimeProfilerRuntimeSizes::fifo_pages;
+    return p;
+}
 
 RealtimeProfilerManager::RealtimeProfilerManager(const std::shared_ptr<MeshDevice>& mesh_device) :
     context_id_(mesh_device->impl().get_context_id()) {
@@ -795,6 +858,7 @@ RealtimeProfilerManager::RealtimeProfilerManager(const std::shared_ptr<MeshDevic
         std::vector<uint32_t> page_buf(RealtimeProfilerRuntimeSizes::page_size / sizeof(uint32_t));
         auto process_one_page = [&](DeviceState& dev_state) -> bool {
             uint32_t available = dev_state.socket->pages_available();
+            record_fifo_sample(available);
             if (available == 0) {
                 return false;
             }

@@ -81,6 +81,22 @@ public:
     // First active device's D2H socket, or nullptr if no device is active.
     D2HSocket* get_socket() const;
 
+    // Host-side D2H FIFO pressure, pooled across all of this process's profiled devices and sampled
+    // by the receiver thread (one sample per device socket per poll). Exposed for stress tests.
+    struct FifoPressure {
+        uint32_t window_max_pages = 0;       // peak occupancy since the previous read
+        uint32_t all_time_max_pages = 0;     // peak occupancy since the profiler started
+        double window_mean_pages = 0.0;      // mean occupancy over samples since the previous read
+        double window_stddev_pages = 0.0;    // stddev over those samples
+        uint64_t window_samples = 0;         // sample count since the previous read
+        double all_time_mean_pages = 0.0;    // mean occupancy over all samples since the profiler started
+        double all_time_stddev_pages = 0.0;  // stddev over all samples since the profiler started
+        uint64_t all_time_samples = 0;       // total sample count since the profiler started
+        uint32_t capacity_pages = 0;         // FIFO capacity; occupancy == capacity means the device backpressured
+    };
+    // Snapshot the stats; also resets the windowed counters. Single reader only.
+    static FifoPressure read_fifo_pressure();
+
 private:
     struct DeviceState {
         IDevice* device = nullptr;
@@ -118,6 +134,8 @@ private:
     };
 
     void run_sync(DeviceState& dev_state, uint32_t num_samples);
+
+    static void record_fifo_sample(uint32_t occupied_pages);
 
     // ContextId of the owning MeshDevice, captured in the constructor. All MetalContext
     // accesses inside this manager must go through MetalContext::instance(context_id_)
