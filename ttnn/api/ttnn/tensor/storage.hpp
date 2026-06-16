@@ -141,7 +141,7 @@ struct DeviceStorage {
     // This function should be removed in-favor of `get_mesh_tensor()`.
     // The function also leaks the ownership of the underlying device memory out.
     // This is meant to be transitional and is to be removed.
-    // Throws if the DeviceStorage is not constructed from a MeshTensor.
+    // Throws if the DeviceStorage is not allocated.
     std::shared_ptr<distributed::MeshBuffer> get_mesh_buffer_leak_ownership() const;
 
     // There are situations where we want to "reinterpret" an existing Tensor without modifying its underlying memory.
