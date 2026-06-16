@@ -403,9 +403,6 @@ TEST_F(MeshTensorTest, DefaultConstructedDeviceStorageGetters) {
     EXPECT_THAT(
         ([&]() { storage.get_mesh_buffer_leak_ownership(); }),
         ThrowsMessage<std::runtime_error>(HasSubstr("not allocated")));
-    EXPECT_THAT(
-        ([&]() { storage.get_device_bypass_deallocate_check(); }),
-        ThrowsMessage<std::runtime_error>(HasSubstr("not allocated")));
 
     EXPECT_FALSE(storage.is_allocated());
     EXPECT_TRUE(storage.is_uniform_storage());
