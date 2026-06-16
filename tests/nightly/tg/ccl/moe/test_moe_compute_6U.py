@@ -270,7 +270,7 @@ _MODELS_BH_LB_1x8 = [
     MoEModelConfig("qwen35_35b",         N=512,  hidden_size=2048, selected_experts_k=8),
     MoEModelConfig("gemma_4_26b",        N=704,  hidden_size=2816, selected_experts_k=8, activation_types=(MoEActivationFunction.GELU,)),
     MoEModelConfig("gpt_oss",            N=2880, hidden_size=2880, selected_experts_k=4, experts_per_device_values=(4,), has_bias_values=(True,), test_modes=("perf", "correctness"), activation_types=(MoEActivationFunction.SWIGLU,), bh_ring_size_values=(8, 12, 16)),
-    MoEModelConfig("qwen3_235b",         N=1536, hidden_size=4096, selected_experts_k=8),
+    MoEModelConfig("qwen3_235b",         N=1536, hidden_size=4096, selected_experts_k=8,experts_per_device_values=(4,)),
     MoEModelConfig("qwen35_397b",        N=1024, hidden_size=4096, selected_experts_k=10),
     MoEModelConfig("glm_47",             N=1536, hidden_size=5120, selected_experts_k=8),
     MoEModelConfig("glm5",               N=2048, hidden_size=6144, selected_experts_k=8),
