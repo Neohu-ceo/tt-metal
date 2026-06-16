@@ -41,7 +41,7 @@ inline void calculate_polygamma(uint32_t n_packed, uint32_t scale_packed) {
 
     // Unpack parameters using Converter (union-based type punning supported by SFPU compiler)
     float n_float = Converter::as_float(n_packed);
-    int n = static_cast<int>(n_float);
+    int n = int(n_float);
     int n_plus_1 = n + 1;
     float scale = Converter::as_float(scale_packed);
 
@@ -49,12 +49,12 @@ inline void calculate_polygamma(uint32_t n_packed, uint32_t scale_packed) {
     // B_2 = 1/6 → coeff = (n+1)/12  (from B_2/(2!) * s*(s-1)... but simplified)
     // B_4 = -1/30 → coeff = -(n+1)(n+2)(n+3)/720
     // B_6 = 1/42  → coeff = (n+1)(n+2)(n+3)(n+4)(n+5)/30240
-    float n1 = static_cast<float>(n + 1);
-    float n2 = static_cast<float>(n + 2);
-    float n3 = static_cast<float>(n + 3);
-    float n4 = static_cast<float>(n + 4);
-    float n5 = static_cast<float>(n + 5);
-    float nf = static_cast<float>(n);
+    float n1 = n + 1;
+    float n2 = n + 2;
+    float n3 = n + 3;
+    float n4 = n + 4;
+    float n5 = n + 5;
+    float nf = n;
     float inv_nf = 1.0f / nf;
     float c_b2 = n1 / 12.0f;                           // B_2 term coefficient
     float c_b4 = -(n1 * n2 * n3) / 720.0f;             // B_4 term coefficient
@@ -63,12 +63,12 @@ inline void calculate_polygamma(uint32_t n_packed, uint32_t scale_packed) {
 #pragma GCC unroll 8
     for (int d = 0; d < ITERATIONS; d++) {
         sfpi::vFloat x = sfpi::dst_reg[0];
-        sfpi::vFloat sum = sfpi::vFloat(0.0f);
+        sfpi::vFloat sum = 0.0f;
 
         // Part 1: Exact summation of first NUM_TERMS terms
         // Σ_{k=0}^{NUM_TERMS-1} 1/(x+k)^(n+1)
         for (int k = 0; k < NUM_TERMS; k++) {
-            sfpi::vFloat xi = x + static_cast<float>(k);
+            sfpi::vFloat xi = x + float(k);
 
             // Compute reciprocal first, then raise to power (avoids overflow of large intermediates)
             sfpi::vFloat inv_xi;
@@ -91,7 +91,7 @@ inline void calculate_polygamma(uint32_t n_packed, uint32_t scale_packed) {
         // Part 2: Euler-Maclaurin asymptotic tail correction
         // For the remaining sum Σ_{k=NUM_TERMS}^{∞} 1/(x+k)^(n+1)
         // at z = x + NUM_TERMS:
-        sfpi::vFloat z = x + static_cast<float>(NUM_TERMS);
+        sfpi::vFloat z = x + float(NUM_TERMS);
 
         sfpi::vFloat inv_z;
         if constexpr (APPROXIMATION_MODE) {

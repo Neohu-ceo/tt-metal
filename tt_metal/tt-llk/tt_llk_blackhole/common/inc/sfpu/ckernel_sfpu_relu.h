@@ -86,7 +86,7 @@ inline void _relu_max_(T threshold)
     {
         if constexpr (std::is_same_v<VectorType, sfpi::vInt>)
         {
-            v_threshold = static_cast<int>(Converter::as_float(threshold));
+            v_threshold = int(Converter::as_float(threshold));
         }
         else
         {
