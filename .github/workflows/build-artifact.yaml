@@ -432,16 +432,20 @@ jobs:
           # otherwise it resolves an invalid URL and the job fails
           REDIS_USER="${{ vars.REDIS_USER }}"
           REDIS_PASSWORD="${{ secrets.REDIS_PASSWORD }}"
-          REDIS_HOST="${{ vars.REDIS_HOST }}"
+          # REMOVE_ME: write to the primary Redis instead of the read-only replicas to test cache population.
+          # vars.REDIS_HOST normally resolves to redis-replicas.redis.svc.cluster.local (read endpoint).
+          REDIS_HOST="redis-master.redis.svc.cluster.local"
           REDIS_PORT="${{ vars.REDIS_PORT }}"
           # ccache 4.13 bug: read-only is std::optional<bool>; the write gate checks
           # `if (entry.config.read_only)` which is true whenever the optional HAS a value —
           # including when that value is false.  Omit the property entirely unless we
           # actually want read-only mode; ccache's default when absent is writable.
           CCACHE_REMOTE_STORAGE="redis://${REDIS_USER}:${REDIS_PASSWORD}@${REDIS_HOST}:${REDIS_PORT}"
-          if [ "${{ vars.REDIS_IS_READONLY }}" = "true" ]; then
-            CCACHE_REMOTE_STORAGE="${CCACHE_REMOTE_STORAGE}|read-only=true"
-          fi
+          # REMOVE_ME: force-writable for cache test — never append read-only, even if vars.REDIS_IS_READONLY=true.
+          # Original block (restore on revert):
+          #   if [ "${{ vars.REDIS_IS_READONLY }}" = "true" ]; then
+          #     CCACHE_REMOTE_STORAGE="${CCACHE_REMOTE_STORAGE}|read-only=true"
+          #   fi
           echo "CCACHE_REMOTE_STORAGE=${CCACHE_REMOTE_STORAGE}" >> $GITHUB_ENV
           echo "CCACHE_REMOTE_STORAGE: ${CCACHE_REMOTE_STORAGE}"
 
