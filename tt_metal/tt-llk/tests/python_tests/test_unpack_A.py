@@ -713,7 +713,10 @@ def test_unpack_A_targeted_tensor_shape_coverage(
             tile_cnt=tile_cnt_A,
             face_r_dim=face_r_dim,
         )
-    elif transpose_of_faces == Transpose.Yes:
+    elif (
+        transpose_of_faces == Transpose.Yes
+        and TestConfig.BUILD_MODE != BuildMode.PRODUCE
+    ):
         transpose_golden = get_golden_generator(TransposeGolden)
         temp_tensor = transpose_golden.transpose_within_faces(
             src_A, formats.output_format, input_dimensions, num_faces

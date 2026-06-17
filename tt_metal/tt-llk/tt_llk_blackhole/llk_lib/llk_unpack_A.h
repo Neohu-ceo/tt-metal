@@ -147,7 +147,7 @@ inline void _llk_unpack_A_mop_config_(
     else if constexpr (BType == BroadcastType::SCALAR)
     {
         static_assert((!acc_to_dest) && "accumulate into dest with broadcast scaler is not supported!");
-        const std::uint32_t outerloop     = num_faces;
+        constexpr std::uint32_t outerloop = 1;
         constexpr std::uint32_t innerloop = 1;
         ckernel_template tmp(outerloop, innerloop, unpack_srcb_inc_z_0);
         tmp.program();

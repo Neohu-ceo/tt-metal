@@ -119,7 +119,7 @@ inline void _llk_unpack_A_mop_config_(
     else if constexpr (BType == BroadcastType::COL)
     {
         constexpr std::uint32_t innerloop = 1;
-        const std::uint32_t outerloop     = num_faces_r_dim;
+        constexpr std::uint32_t outerloop = 1;
         ckernel_template tmp(
             outerloop, innerloop, unpack_srcb, num_faces_c_dim < MAX_NUM_FACES_C_DIM ? TT_OP_SETADCZW(p_setadc::UNP_B, 0, 0, 0, 1, 0b0001) : srcb_set_z_2);
         // ELWADD used in datacopy for float16
@@ -130,7 +130,7 @@ inline void _llk_unpack_A_mop_config_(
     else if constexpr (BType == BroadcastType::ROW)
     {
         constexpr std::uint32_t innerloop = 1;
-        const std::uint32_t outerloop     = num_faces_r_dim;
+        constexpr std::uint32_t outerloop = 1;
         ckernel_template tmp(outerloop, innerloop, unpack_srcb_unpack_srcb, srcb_clear_z);
         if constexpr (acc_to_dest)
         {
@@ -142,7 +142,7 @@ inline void _llk_unpack_A_mop_config_(
     else if constexpr (BType == BroadcastType::SCALAR)
     {
         static_assert((!acc_to_dest) && "accumulate into dest with broadcast scaler is not supported!");
-        const std::uint32_t outerloop     = num_faces;
+        constexpr std::uint32_t outerloop = 1;
         constexpr std::uint32_t innerloop = 1;
         ckernel_template tmp(outerloop, innerloop, unpack_srcb_inc_z_0);
         // ELWADD used in datacopy for float16
