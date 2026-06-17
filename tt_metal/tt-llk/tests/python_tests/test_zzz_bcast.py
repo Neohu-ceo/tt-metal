@@ -34,6 +34,8 @@ from helpers.test_variant_parameters import (
     DISABLE_SRC_ZERO_FLAG,
     NUM_BLOCKS,
     NUM_FACES,
+    NUM_FACES_C_DIM,
+    NUM_FACES_R_DIM,
     NUM_TILES_IN_BLOCK,
     PARTIAL_FACE,
     REUSE_DEST_TYPE,
@@ -63,8 +65,8 @@ supported_formats = [
 
 
 @parametrize(
-    # enable tiny tiles tests when they're added formally to the LLKs
-    # tile_dimensions=[[1, 32], [2, 32], [4, 32], [8, 32], [16, 32], [32, 32]],
+    # Tiny broadcast coverage stays in focused unpack-A tests until this broader
+    # bcast harness is validated for dense tiny-tile goldens.
     tile_dimensions=[[32, 32]],
     formats=input_output_formats(supported_formats, same=True),
     broadcast_type=[
@@ -99,9 +101,18 @@ def test_unpack_bcast(
 
     # --- Skips from bugs --------------------------------------------------
 
-    # TODO: pgardner - Column broadcast for tiny tiles needs kernel support
-    if tile_dimensions != [32, 32] and broadcast_type == BroadcastType.Column:
-        pytest.skip("Column broadcast not yet implemented for tiny tiles")
+    if tile_dimensions == [32, 16] and broadcast_type == BroadcastType.Column:
+        pytest.skip("Column broadcast is not supported for narrow 32x16 tiles")
+
+    if tile_dimensions != [32, 32] and dest_acc == DestAccumulation.Yes:
+        pytest.skip("Tiny tile bcast/datacopy with dest_acc=Yes is not yet validated")
+
+    if (
+        tile_dimensions != [32, 32]
+        and tile_dimensions != [16, 16]
+        and broadcast_type == BroadcastType.Row
+    ):
+        pytest.skip("Non-square row broadcast is not yet validated for tiny tiles")
 
     # TODO: pgardner - Bfp8_b requires minimum 16 exponents per face
     if tile_dimensions[0] < 16 and formats.input_format == DataFormat.Bfp8_b:
@@ -183,6 +194,8 @@ def test_unpack_bcast(
             UNPACK_TRANS_FACES(Transpose.No),
             UNPACK_TRANS_WITHIN_FACE(Transpose.No),
             NUM_FACES(num_faces),
+            NUM_FACES_R_DIM(num_faces_r_dim, num_faces_r_dim),
+            NUM_FACES_C_DIM(num_faces_c_dim, num_faces_c_dim),
             TILE_COUNT(tile_cnt_A),
             TEST_FACE_DIMS(face_r_dim=face_r_dim),
             NUM_TILES_IN_BLOCK(num_tiles_in_block),

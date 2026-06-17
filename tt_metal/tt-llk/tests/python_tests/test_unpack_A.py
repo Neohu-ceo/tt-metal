@@ -604,6 +604,9 @@ targeted_tensor_shape_cases = [
         1,
         [8, 16],
         None,
+        BroadcastType.None_,
+        Transpose.No,
+        Transpose.No,
         id="tensor_shape_FR8_NF1x1",
     ),
     pytest.param(
@@ -614,13 +617,56 @@ targeted_tensor_shape_cases = [
         1,
         [32, 16],
         [32, 16],
+        BroadcastType.None_,
+        Transpose.No,
+        Transpose.No,
         id="tensor_shape_FR16_NF2x1",
+    ),
+    pytest.param(
+        "fr16_nf1x1_col_bcast",
+        16,
+        1,
+        1,
+        1,
+        [16, 16],
+        [16, 16],
+        BroadcastType.Column,
+        Transpose.No,
+        Transpose.No,
+        id="tensor_shape_FR16_NF1x1_col_bcast",
+    ),
+    pytest.param(
+        "fr16_nf1x2_scalar_bcast",
+        16,
+        2,
+        1,
+        2,
+        [16, 32],
+        [16, 32],
+        BroadcastType.Scalar,
+        Transpose.No,
+        Transpose.No,
+        id="tensor_shape_FR16_NF1x2_scalar_bcast",
+    ),
+    pytest.param(
+        "fr16_nf1x1_transpose",
+        16,
+        1,
+        1,
+        1,
+        [16, 16],
+        [16, 16],
+        BroadcastType.None_,
+        Transpose.Yes,
+        Transpose.Yes,
+        id="tensor_shape_FR16_NF1x1_transpose",
     ),
 ]
 
 
 @pytest.mark.parametrize(
-    "case_name, face_r_dim, num_faces, num_faces_r_dim, num_faces_c_dim, input_dimensions, tile_dimensions",
+    "case_name, face_r_dim, num_faces, num_faces_r_dim, num_faces_c_dim, input_dimensions, tile_dimensions, "
+    "broadcast_type, transpose_of_faces, within_face_16x16_transpose",
     targeted_tensor_shape_cases,
 )
 def test_unpack_A_targeted_tensor_shape_coverage(
@@ -631,6 +677,9 @@ def test_unpack_A_targeted_tensor_shape_coverage(
     num_faces_c_dim,
     input_dimensions,
     tile_dimensions,
+    broadcast_type,
+    transpose_of_faces,
+    within_face_16x16_transpose,
 ):
     del case_name
     formats = FormatConfig(
@@ -654,15 +703,34 @@ def test_unpack_A_targeted_tensor_shape_coverage(
         **stimuli_kwargs,
     )
 
-    generate_golden = get_golden_generator(DataCopyGolden)
-    golden_tensor = generate_golden(
-        src_A,
-        formats.output_format,
-        num_faces,
-        input_dimensions,
-        face_r_dim,
-        tile_dimensions=tile_dimensions,
-    )
+    if broadcast_type != BroadcastType.None_:
+        generate_broadcast_golden = get_golden_generator(BroadcastGolden)
+        golden_tensor = generate_broadcast_golden(
+            broadcast_type,
+            src_A,
+            formats.output_format,
+            num_faces=num_faces,
+            tile_cnt=tile_cnt_A,
+            face_r_dim=face_r_dim,
+        )
+    elif transpose_of_faces == Transpose.Yes:
+        transpose_golden = get_golden_generator(TransposeGolden)
+        temp_tensor = transpose_golden.transpose_within_faces(
+            src_A, formats.output_format, input_dimensions, num_faces
+        )
+        golden_tensor = transpose_golden.transpose_faces(
+            temp_tensor, formats.output_format, input_dimensions, num_faces
+        )
+    else:
+        generate_golden = get_golden_generator(DataCopyGolden)
+        golden_tensor = generate_golden(
+            src_A,
+            formats.output_format,
+            num_faces,
+            input_dimensions,
+            face_r_dim,
+            tile_dimensions=tile_dimensions,
+        )
 
     raw_dimensions = [
         (
@@ -690,7 +758,7 @@ def test_unpack_A_targeted_tensor_shape_coverage(
         formats,
         templates=[
             STOCHASTIC_ROUNDING(StochasticRounding.No),
-            BROADCAST_TYPE(BroadcastType.None_),
+            BROADCAST_TYPE(broadcast_type),
             ACC_TO_DEST(False),
             REUSE_DEST_TYPE(EltwiseBinaryReuseDestType.NONE),
             PARTIAL_FACE(
@@ -702,8 +770,8 @@ def test_unpack_A_targeted_tensor_shape_coverage(
             DISABLE_SRC_ZERO_FLAG(False),
         ],
         runtimes=[
-            UNPACK_TRANS_FACES(Transpose.No),
-            UNPACK_TRANS_WITHIN_FACE(Transpose.No),
+            UNPACK_TRANS_FACES(transpose_of_faces),
+            UNPACK_TRANS_WITHIN_FACE(within_face_16x16_transpose),
             NUM_FACES(num_faces),
             NUM_FACES_R_DIM(num_faces_r_dim, num_faces_r_dim),
             NUM_FACES_C_DIM(num_faces_c_dim, num_faces_c_dim),

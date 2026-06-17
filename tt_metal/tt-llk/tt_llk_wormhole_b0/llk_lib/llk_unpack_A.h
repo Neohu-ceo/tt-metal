@@ -53,7 +53,9 @@ inline void _llk_unpack_A_mop_config_(
         "Not supported configuration when unpacking to dest!");
     LLK_DPRINT_TENSOR_SHAPE(ckernel::coverage::TensorShapeFunctionCoverage::_llk_unpack_A_mop_config_, tensor_shape);
     LLK_ASSERT(validate_tensor_shape_tile_dependent_ops_(tensor_shape), "Invalid tensor shape for tile-dependent op");
-    const std::uint8_t num_faces = tensor_shape.total_num_faces();
+    const std::uint8_t num_faces       = tensor_shape.total_num_faces();
+    const std::uint8_t num_faces_r_dim = tensor_shape.num_faces_r_dim;
+    const std::uint8_t num_faces_c_dim = tensor_shape.num_faces_c_dim;
 
     static constexpr std::uint32_t unpack_srca =
         TT_OP_UNPACR(SrcA, 0b1 /*Z inc*/, 0, 0, 0, 1 /* Set OvrdThreadId*/, 1 /*Set Dvalid*/, p_unpacr::RAREFYB_DISABLE, 0, 0, 0, 0, 1);
@@ -84,24 +86,24 @@ inline void _llk_unpack_A_mop_config_(
 
     if (should_unpack_to_dest(unpack_to_dest, unpack_src_format, unpack_dst_format))
     {
-        if (transpose_of_faces && num_faces == 4)
+        if (transpose_of_faces && num_faces_r_dim == 2 && num_faces_c_dim == 2)
         {
-            const std::uint32_t outerloop = 2;
-            const std::uint32_t innerloop = 2;
+            const std::uint32_t outerloop = num_faces_r_dim;
+            const std::uint32_t innerloop = num_faces_c_dim;
             ckernel_template tmp(outerloop, innerloop, unpack_srca_to_dest_transpose_of_faces);
             tmp.set_end_op(TT_OP_SETADCZW(p_setadc::UNP_A, 0, 2, 0, 1, 0b0101));
             tmp.program();
         }
         else if (BType == BroadcastType::ROW || BType == BroadcastType::SCALAR)
         {
-            constexpr std::uint32_t outerloop = BType == BroadcastType::ROW ? 2 : 1;
+            const std::uint32_t outerloop     = BType == BroadcastType::ROW ? num_faces_r_dim : num_faces;
             constexpr std::uint32_t innerloop = 1;
             ckernel_template tmp(outerloop, innerloop, unpack_srca_to_dest);
             tmp.program();
         }
         else if (BType == BroadcastType::COL)
         {
-            constexpr std::uint32_t outerloop = 2;
+            const std::uint32_t outerloop     = num_faces_r_dim;
             constexpr std::uint32_t innerloop = 1;
             ckernel_template tmp(outerloop, innerloop, unpack_srca_to_dest_column);
             tmp.program();
@@ -117,8 +119,9 @@ inline void _llk_unpack_A_mop_config_(
     else if constexpr (BType == BroadcastType::COL)
     {
         constexpr std::uint32_t innerloop = 1;
-        constexpr std::uint32_t outerloop = 1; // TODO: add support for num_faces
-        ckernel_template tmp(outerloop, innerloop, unpack_srcb, srcb_set_z_2);
+        const std::uint32_t outerloop     = num_faces_r_dim;
+        ckernel_template tmp(
+            outerloop, innerloop, unpack_srcb, num_faces_c_dim < MAX_NUM_FACES_C_DIM ? TT_OP_SETADCZW(p_setadc::UNP_B, 0, 0, 0, 1, 0b0001) : srcb_set_z_2);
         // ELWADD used in datacopy for float16
         tmp.set_start_op(unpack_srca_zerosrc_set_dvalid);
         tmp.set_end_op(unpack_srcb);
@@ -127,7 +130,7 @@ inline void _llk_unpack_A_mop_config_(
     else if constexpr (BType == BroadcastType::ROW)
     {
         constexpr std::uint32_t innerloop = 1;
-        constexpr std::uint32_t outerloop = 1; // TODO: add support for num_faces
+        const std::uint32_t outerloop     = num_faces_r_dim;
         ckernel_template tmp(outerloop, innerloop, unpack_srcb_unpack_srcb, srcb_clear_z);
         if constexpr (acc_to_dest)
         {
@@ -139,7 +142,7 @@ inline void _llk_unpack_A_mop_config_(
     else if constexpr (BType == BroadcastType::SCALAR)
     {
         static_assert((!acc_to_dest) && "accumulate into dest with broadcast scaler is not supported!");
-        constexpr std::uint32_t outerloop = 1;
+        const std::uint32_t outerloop     = num_faces;
         constexpr std::uint32_t innerloop = 1;
         ckernel_template tmp(outerloop, innerloop, unpack_srcb_inc_z_0);
         // ELWADD used in datacopy for float16
@@ -154,7 +157,7 @@ inline void _llk_unpack_A_mop_config_(
             lltt::record(4, replay_buf_len);
             TTI_UNPACR_NOP(SrcB, p_unpacr_nop::UNP_ZEROSRC);
             TTI_UNPACR_NOP(SrcB, p_unpacr_nop::UNP_SET_DVALID);
-            if (num_faces > 2)
+            if (num_faces_c_dim > 1)
             {
                 TTI_UNPACR(SrcA, 0b10, 0, 0, 0, 1, 1, p_unpacr::RAREFYB_DISABLE, 0, 0, 0, 0, 1); // inc srcA ch0_z+=2
             }
@@ -163,11 +166,11 @@ inline void _llk_unpack_A_mop_config_(
                 TTI_UNPACR(SrcA, 0b01, 0, 0, 0, 1, 1, p_unpacr::RAREFYB_DISABLE, 0, 0, 0, 0, 1); // inc srcA ch0_z+=1
             }
 
-            const std::uint32_t outerloop = num_faces < 4 ? 1 : 2;
-            const std::uint32_t innerloop = num_faces < 2 ? 1 : 2;
+            const std::uint32_t outerloop = num_faces_r_dim;
+            const std::uint32_t innerloop = num_faces_c_dim;
             ckernel_template tmp(outerloop, innerloop, lltt::replay_insn(4, replay_buf_len)); // Unpack faces 0/2 && 1/3 to srcA
                                                                                               // or 0/1 for 2 face tile
-            if (num_faces > 2)
+            if (num_faces_r_dim > 1)
             {
                 tmp.set_end_op(srca_set_z_1);
             }
@@ -241,11 +244,19 @@ inline void _llk_unpack_A_init_(
 {
     LLK_DPRINT_TENSOR_SHAPE(ckernel::coverage::TensorShapeFunctionCoverage::_llk_unpack_A_init_, tensor_shape);
     LLK_ASSERT(validate_tensor_shape_tile_dependent_ops_(tensor_shape), "Invalid tensor shape for tile-dependent op");
-    const std::uint8_t face_r_dim = tensor_shape.face_r_dim;
-    const std::uint8_t num_faces  = tensor_shape.total_num_faces();
-    LLK_ASSERT(BType != BroadcastType::COL || num_faces == 4, "Unary Broadcast Column requires num_faces == 4 (32x32 only)");
+    const std::uint8_t face_r_dim       = tensor_shape.face_r_dim;
+    const std::uint8_t num_faces_r_dim  = tensor_shape.num_faces_r_dim;
+    const std::uint8_t num_faces_c_dim  = tensor_shape.num_faces_c_dim;
+    const std::uint8_t total_num_faces  = tensor_shape.total_num_faces();
+    const bool unsupported_narrow_bcast = num_faces_c_dim < num_faces_r_dim;
+    LLK_ASSERT(BType != BroadcastType::COL || !unsupported_narrow_bcast, "Unary Broadcast Column with 32x16 narrow tile is not supported");
+    LLK_ASSERT(
+        BType != BroadcastType::ROW || total_num_faces == 1 || num_faces_r_dim == num_faces_c_dim,
+        "Unary Broadcast Row requires a square face grid until non-square row broadcast is validated");
     LLK_ASSERT(transpose_of_faces == 0 || face_r_dim == 16, "Partial faces are not supported for transpose datacopy, face_r_dim must be 16 rows");
-    LLK_ASSERT(transpose_of_faces == 0 || num_faces == 4 || num_faces == 1, "Transpose requires num_faces == 4 or 1 (32x32 and 16x16 only)");
+    LLK_ASSERT(
+        transpose_of_faces == 0 || total_num_faces == 1 || num_faces_r_dim == num_faces_c_dim,
+        "Transpose requires a square face grid until non-square transpose is validated");
     LLK_ASSERT(
         is_unpacker_format_conversion_supported_dest(static_cast<DataFormat>(unpack_src_format), static_cast<DataFormat>(unpack_dst_format), unpack_to_dest),
         "Unsupported unpacker format conversion.");
@@ -383,6 +394,6 @@ inline void _llk_unpack_A_(const std::uint32_t address, const std::uint32_t unpa
  * @note Call @ref _llk_unpack_A_init_ with matching template args before this function.
  */
 template <BroadcastType BType = BroadcastType::NONE>
-inline void _llk_unpack_A_uninit_()
+inline void _llk_unpack_A_uninit_([[maybe_unused]] const ckernel::TensorShape tensor_shape = ckernel::DEFAULT_TENSOR_SHAPE)
 {
 }
