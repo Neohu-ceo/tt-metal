@@ -40,9 +40,7 @@ inline void calculate_polygamma(uint32_t n_packed, uint32_t scale_packed) {
     constexpr int NUM_TERMS = 11;  // Exact terms (k=0..10)
 
     // Unpack parameters using Converter (union-based type punning supported by SFPU compiler)
-    float n_float = Converter::as_float(n_packed);
-    int n = int(n_float);
-    int n_plus_1 = n + 1;
+    int n = int(Converter::as_float(n_packed));
     float scale = Converter::as_float(scale_packed);
 
     // Precompute Bernoulli-related coefficients for asymptotic tail
@@ -75,21 +73,24 @@ inline void calculate_polygamma(uint32_t n_packed, uint32_t scale_packed) {
             sfpi::vFloat inv_xi = sfpu_reciprocal_iter<RECIP>(xi);
 
             sfpi::vFloat inv_power = inv_xi;
-            for (int j = 1; j < n_plus_1; j++) {
+            for (int j = 1; j <= n; j++) {
                 inv_power = inv_power * inv_xi;
             }
 
-            sum = sum + inv_power;
+            sum += inv_power;
         }
 
         // Part 2: Euler-Maclaurin asymptotic tail correction
         // For the remaining sum Σ_{k=NUM_TERMS}^{∞} 1/(x+k)^(n+1)
         // at z = x + NUM_TERMS:
         sfpi::vFloat z = x + float(NUM_TERMS);
-
         sfpi::vFloat inv_z = sfpu_reciprocal_iter<RECIP>(z);
-
         sfpi::vFloat inv_z2 = inv_z * inv_z;
+
+        // Use PolynomialEvaluator for the Bernoulli polynomial in the tail:
+        // E = inv_nf + c_b2*inv_z2 + c_b4*inv_z2^2 + c_b6*inv_z2^3
+        sfpi::vFloat E = PolynomialEvaluator::eval(inv_z2, inv_nf, c_b2, c_b4, c_b6);
+        sfpi::vFloat tail = E + 0.5f * inv_z;
 
         // Compute inv_z^n by repeated multiplication
         sfpi::vFloat inv_z_n = inv_z;  // inv_z^1
@@ -97,12 +98,7 @@ inline void calculate_polygamma(uint32_t n_packed, uint32_t scale_packed) {
             inv_z_n = inv_z_n * inv_z;  // inv_z^n
         }
 
-        // Use PolynomialEvaluator for the Bernoulli polynomial in the tail:
-        // E = inv_nf + c_b2*inv_z2 + c_b4*inv_z2^2 + c_b6*inv_z2^3
-        sfpi::vFloat E = PolynomialEvaluator::eval(inv_z2, inv_nf, c_b2, c_b4, c_b6);
-        sfpi::vFloat tail = inv_z_n * (E + 0.5f * inv_z);
-
-        sum = sum + tail;
+        sum += tail * inv_z_n;
 
         // Apply scale: (-1)^(n+1) * n!
         sfpi::vFloat result = sum * scale;
