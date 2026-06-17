@@ -637,13 +637,13 @@ HostTensor make_full_coverage_aligned_host_tensor(
         return make_aligned_host_buffer(static_cast<size_t>(shape.volume()), shard_fills.at(idx++));
     });
     auto topology = TensorTopology::create_sharded_tensor_topology(mesh_shape);
-    return HostTensor(std::move(dhb), spec, topology);
+    return HostTensor::from_buffer(std::move(dhb), spec, topology);
 }
 
 // Helper: create a HostTensor with a single shard at [0,0].
 HostTensor make_single_shard_host_tensor(const ttnn::Shape& shape, uint32_t fill) {
     auto spec = TensorSpec(shape, TensorLayout(DataType::UINT32, Layout::ROW_MAJOR, MemoryConfig{}));
-    return HostTensor(HostBuffer(std::vector<uint32_t>(shape.volume(), fill)), spec, TensorTopology{});
+    return HostTensor::from_buffer(HostBuffer(std::vector<uint32_t>(shape.volume(), fill)), spec, TensorTopology{});
 }
 
 // Helper: create a HostTensor with one shard per coordinate in a mesh.
@@ -658,7 +658,7 @@ HostTensor make_full_coverage_host_tensor(
         return HostBuffer(std::vector<uint32_t>(shape.volume(), shard_fills.at(idx++)));
     });
     auto topology = TensorTopology::create_sharded_tensor_topology(mesh_shape);
-    return HostTensor(std::move(dhb), spec, topology);
+    return HostTensor::from_buffer(std::move(dhb), spec, topology);
 }
 
 // Helper: create a HostTensor with shards at only a subset of mesh coordinates.
@@ -674,7 +674,7 @@ HostTensor make_partial_coverage_host_tensor(
         return HostBuffer(std::vector<uint32_t>(shape.volume(), shard_fills.at(idx++)));
     });
     auto topology = TensorTopology::create_sharded_tensor_topology(distributed::MeshShape(coords.size()));
-    return HostTensor(std::move(dhb), spec, topology);
+    return HostTensor::from_buffer(std::move(dhb), spec, topology);
 }
 
 // Helper: assert that two HostTensors have the same populated coords and identical shard contents.
@@ -761,7 +761,7 @@ TEST_F(MeshTensorDataMovementTest, IsUniformWrite_EmptyDistributedHostBuffer) {
     const ttnn::Shape shape{1, 1, 32, 32};
     auto spec = TensorSpec(shape, TensorLayout(DataType::UINT32, Layout::ROW_MAJOR, MemoryConfig{}));
     auto dhb = DistributedHostBuffer::create(mesh_device_->shape());
-    HostTensor host_tensor(std::move(dhb), spec, TensorTopology{});
+    HostTensor host_tensor = HostTensor::from_buffer(std::move(dhb), spec, TensorTopology{});
     EXPECT_FALSE(is_uniform_write(host_tensor, *mesh_device_));
     auto& cq = mesh_device_->mesh_command_queue();
     EXPECT_ANY_THROW(enqueue_write_tensor(cq, host_tensor, *mesh_device_));
@@ -801,7 +801,7 @@ TEST_F(MeshTensorDataMovementTest, UniformCopyToDevice_CopyToHost_Roundtrip) {
     for (const auto& coord : distributed::MeshCoordinateRange(mesh_device_->shape())) {
         result_dhb.emplace_shard(coord, [&]() { return tensor_impl::allocate_host_buffer(spec); });
     }
-    HostTensor result(std::move(result_dhb), spec, TensorTopology{});
+    HostTensor result = HostTensor::from_buffer(std::move(result_dhb), spec, TensorTopology{});
     enqueue_read_tensor(cq, device_tensor, result);
 
     expect_host_tensors_eq(host_tensor, result);
@@ -860,7 +860,7 @@ TEST_F(MeshTensorPinnedMemoryBudgetTest, LargeHostWriteOverHardwarePinBudgetFall
             tt::stl::Span<uint32_t>(reinterpret_cast<uint32_t*>(mapping_owner.get()), num_words),
             tt::tt_metal::MemoryPin(std::static_pointer_cast<void>(mapping_owner)));
     });
-    HostTensor large_host_tensor(
+    HostTensor large_host_tensor = HostTensor::from_buffer(
         std::move(large_dhb), large_spec, TensorTopology::create_sharded_tensor_topology(mesh_device_->shape()));
 
     auto& cq = mesh_device_->mesh_command_queue();
@@ -1007,7 +1007,7 @@ TEST_F(MeshTensorTest, UniformCopyToHost_ReusesPinnedMemoryCacheEntries) {
     for (const auto& coord : distributed::MeshCoordinateRange(mesh_device_->shape())) {
         result_dhb.emplace_shard(coord, [&]() { return tensor_impl::allocate_host_buffer(spec); });
     }
-    HostTensor result(std::move(result_dhb), spec, TensorTopology{});
+    HostTensor result = HostTensor::from_buffer(std::move(result_dhb), spec, TensorTopology{});
 
     const size_t entries_before = cache.num_entries();
     enqueue_read_tensor(cq, device_tensor, result);
@@ -1094,7 +1094,7 @@ TEST_F(MeshTensorDataMovementTest, EnqueueWriteTensor_FilterEmpty_Noop) {
     for (const auto& coord : distributed::MeshCoordinateRange(mesh_device_->shape())) {
         result_dhb.emplace_shard(coord, [&]() { return tensor_impl::allocate_host_buffer(spec); });
     }
-    HostTensor result(std::move(result_dhb), spec, TensorTopology{});
+    HostTensor result = HostTensor::from_buffer(std::move(result_dhb), spec, TensorTopology{});
     enqueue_read_tensor(cq, device_tensor, result);
     expect_host_tensors_eq(host_sentinel, result);
 }
@@ -1154,7 +1154,7 @@ TEST_F(MeshTensorDataMovementTest, NonUniformCopyToDevice_CopyToHost_Roundtrip) 
     for (const auto& coord : written_coords) {
         result_dhb.emplace_shard(coord, [&]() { return tensor_impl::allocate_host_buffer(spec); });
     }
-    HostTensor result(std::move(result_dhb), spec, TensorTopology{});
+    HostTensor result = HostTensor::from_buffer(std::move(result_dhb), spec, TensorTopology{});
     non_uniform_data_movement::enqueue_read_tensor(cq, device_tensor, result, written_coords);
     expect_host_tensors_eq(host_tensor, result);
 }
@@ -1324,7 +1324,7 @@ TEST_F(MeshTensorTest, LargeWriteRoundtrip_PinnedMemoryPath) {
         return HostBuffer(std::move(data));
     });
     auto topology = TensorTopology::create_sharded_tensor_topology(mesh_device_->shape());
-    HostTensor host_tensor(std::move(dhb), spec, topology);
+    HostTensor host_tensor = HostTensor::from_buffer(std::move(dhb), spec, topology);
 
     auto& cq = mesh_device_->mesh_command_queue();
     MeshTensor device_tensor = enqueue_write_tensor(cq, host_tensor, *mesh_device_);
@@ -1363,7 +1363,7 @@ TEST_F(MeshTensorTest, LargeWriteRoundtrip_HeightShardedDeviceRequiringShardPadd
         return HostBuffer(std::move(data));
     });
     auto topology = TensorTopology::create_sharded_tensor_topology(mesh_device_->shape());
-    HostTensor host_tensor(
+    HostTensor host_tensor = HostTensor::from_buffer(
         std::move(dhb), TensorSpec(shape, TensorLayout(DataType::UINT32, Layout::ROW_MAJOR, MemoryConfig{})), topology);
 
     const size_t entries_before = cache.num_entries();

@@ -48,16 +48,6 @@ TEST(MeshTensorTypeTraitsTest, IsNothrowMoveConstructible) {
 
 TEST(MeshTensorTypeTraitsTest, IsNothrowMoveAssignable) { EXPECT_TRUE(std::is_nothrow_move_assignable_v<MeshTensor>); }
 
-TEST(MeshTensorTest, ConstructionWithNullMeshBufferFails) {
-    auto page_config = PageConfig(Layout::ROW_MAJOR);
-    auto memory_config = MemoryConfig{TensorMemoryLayout::INTERLEAVED, BufferType::DRAM};
-    auto tensor_layout = TensorLayout(DataType::BFLOAT16, page_config, memory_config);
-    auto spec = TensorSpec(Shape{1, 32}, tensor_layout);
-    auto topology = TensorTopology();
-
-    EXPECT_ANY_THROW(MeshTensor(nullptr, std::move(spec), std::move(topology)));
-}
-
 // Device-based tests using GenericMeshDeviceFixture
 using MeshTensorDeviceTest = GenericMeshDeviceFixture;
 
@@ -93,9 +83,10 @@ TEST_F(MeshTensorDeviceTest, ConstructionWithMeshBuffer) {
 
     auto topology = TensorTopology();
 
-    MeshTensor tensor(mesh_buffer, std::move(spec), std::move(topology));
+    auto buffer_address = mesh_buffer->address();
+    MeshTensor tensor = MeshTensor::from_buffer(std::move(*mesh_buffer), std::move(spec), std::move(topology));
 
-    EXPECT_EQ(&tensor.mesh_buffer(), mesh_buffer.get());
+    EXPECT_EQ(tensor.address(), buffer_address);
     EXPECT_EQ(&tensor.device(), mesh_device_.get());
     EXPECT_EQ(tensor.dtype(), DataType::BFLOAT16);
     EXPECT_EQ(tensor.layout(), Layout::ROW_MAJOR);
@@ -111,7 +102,7 @@ TEST_F(MeshTensorDeviceTest, MoveConstructionTransfersOwnership) {
     auto mesh_buffer = create_mesh_buffer(*mesh_device_, spec);
     auto topology = TensorTopology();
 
-    MeshTensor original(mesh_buffer, std::move(spec), std::move(topology));
+    MeshTensor original = MeshTensor::from_buffer(std::move(*mesh_buffer), std::move(spec), std::move(topology));
     const auto* buffer_ptr = &original.mesh_buffer();
 
     MeshTensor moved(std::move(original));
@@ -131,8 +122,8 @@ TEST_F(MeshTensorDeviceTest, MoveAssignmentTransfersOwnership) {
     auto mesh_buffer1 = create_mesh_buffer(*mesh_device_, spec1);
     auto mesh_buffer2 = create_mesh_buffer(*mesh_device_, spec2);
 
-    MeshTensor tensor1(mesh_buffer1, std::move(spec1), TensorTopology());
-    MeshTensor tensor2(mesh_buffer2, std::move(spec2), TensorTopology());
+    MeshTensor tensor1 = MeshTensor::from_buffer(std::move(*mesh_buffer1), std::move(spec1), TensorTopology());
+    MeshTensor tensor2 = MeshTensor::from_buffer(std::move(*mesh_buffer2), std::move(spec2), TensorTopology());
 
     const auto* buffer1_ptr = &tensor1.mesh_buffer();
 
@@ -151,7 +142,7 @@ TEST_F(MeshTensorDeviceTest, TensorProperties) {
     auto mesh_buffer = create_mesh_buffer(*mesh_device_, spec);
     auto topology = TensorTopology();
 
-    MeshTensor tensor(mesh_buffer, std::move(spec), std::move(topology));
+    MeshTensor tensor = MeshTensor::from_buffer(std::move(*mesh_buffer), std::move(spec), std::move(topology));
 
     EXPECT_EQ(tensor.dtype(), DataType::FLOAT32);
     EXPECT_EQ(tensor.layout(), Layout::ROW_MAJOR);
@@ -225,7 +216,7 @@ TEST_F(MeshTensorDeviceTest, ConstructionWithTooSmallBufferFails) {
 
     auto topology = TensorTopology();
 
-    EXPECT_ANY_THROW(MeshTensor(mesh_buffer, std::move(spec), std::move(topology)));
+    EXPECT_ANY_THROW(MeshTensor::from_buffer(std::move(*mesh_buffer), std::move(spec), std::move(topology)));
 }
 
 }  // namespace CMAKE_UNIQUE_NAMESPACE

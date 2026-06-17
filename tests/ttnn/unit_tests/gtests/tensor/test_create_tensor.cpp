@@ -59,7 +59,7 @@ void run_create_tensor_test(tt::tt_metal::distributed::MeshDevice* device, const
     ASSERT_EQ(input_buf_size_datums * datum_size_bytes, tensor_spec.compute_packed_buffer_size_bytes());
     auto input_buffer = tt::tt_metal::tensor_impl::allocate_device_buffer(device, tensor_spec);
 
-    Tensor input_tensor(tt::tt_metal::MeshTensor(input_buffer, tensor_spec, TensorTopology{}));
+    Tensor input_tensor(tt::tt_metal::MeshTensor::from_buffer(std::move(*input_buffer), tensor_spec, TensorTopology{}));
 
     ttnn::write_buffer(io_cq, input_tensor, {host_data});
 
