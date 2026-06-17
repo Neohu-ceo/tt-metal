@@ -45,7 +45,7 @@ inline sfpi::vFloat _calculate_isposinf_(const sfpi::vFloat& in)
     // SFPU microcode
     sfpi::vInt exp     = sfpi::exexp(in);
     sfpi::vInt man     = sfpi::exman(in);
-    sfpi::vInt is_pos  = sfpi::lz(in);
+    sfpi::vInt is_pos  = sfpi::lz(sfpi::as<sfpi::vUInt>(in));
     sfpi::vFloat out   = 0.0f;
     v_if (is_pos != 0 && exp == 128 && man == 0)
     {
@@ -68,7 +68,7 @@ inline sfpi::vFloat _calculate_isneginf_(const sfpi::vFloat& in)
     // SFPU microcode
     sfpi::vInt exp     = sfpi::exexp(in);
     sfpi::vInt man     = sfpi::exman(in);
-    sfpi::vInt is_pos  = sfpi::lz(in);
+    sfpi::vInt is_pos  = sfpi::lz(sfpi::as<sfpi::vUInt>(in));
     sfpi::vFloat out   = 0.0f;
     v_if (is_pos == 0 && exp == 128 && man == 0)
     {
