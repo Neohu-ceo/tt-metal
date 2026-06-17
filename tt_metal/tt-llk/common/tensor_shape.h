@@ -221,10 +221,6 @@ constexpr const char* tensor_shape_dim_name(const std::uint8_t dim)
 #define LLK_DPRINT_TENSOR_SHAPE_EMIT_(fn_name, ts) ((void)0)
 #endif
 
-// Per-call-site dedupe trims DPRINT volume to unique shapes per variant while
-// preserving the host-side parser contract. The table covers the 20 valid shapes
-// plus slack for out-of-bounds regressions.
-#define LLK_DPRINT_DEDUP_MAX 32
 #define LLK_DPRINT_TENSOR_SHAPE(fn, ts)                            \
     do                                                             \
     {                                                              \

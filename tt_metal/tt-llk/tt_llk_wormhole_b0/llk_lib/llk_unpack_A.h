@@ -131,6 +131,7 @@ inline void _llk_unpack_A_mop_config_(
     {
         constexpr std::uint32_t innerloop = 1;
         constexpr std::uint32_t outerloop = 1;
+        // TODO(#47328): tiny ROW layouts need a separate replay-aware MOP.
         ckernel_template tmp(outerloop, innerloop, unpack_srcb_unpack_srcb, srcb_clear_z);
         if constexpr (acc_to_dest)
         {
@@ -249,10 +250,12 @@ inline void _llk_unpack_A_init_(
     const std::uint8_t num_faces_c_dim  = tensor_shape.num_faces_c_dim;
     const std::uint8_t total_num_faces  = tensor_shape.total_num_faces();
     const bool unsupported_narrow_bcast = num_faces_c_dim < num_faces_r_dim;
+    // TODO(#47328): add direct coverage before enabling narrow COL broadcast.
     LLK_ASSERT(BType != BroadcastType::COL || !unsupported_narrow_bcast, "Unary Broadcast Column with 32x16 narrow tile is not supported");
+    // TODO(#47328): add direct coverage before enabling tiny ROW broadcast.
     LLK_ASSERT(
-        BType != BroadcastType::ROW || total_num_faces == 1 || num_faces_r_dim == num_faces_c_dim,
-        "Unary Broadcast Row requires a square face grid until non-square row broadcast is validated");
+        BType != BroadcastType::ROW || (num_faces_r_dim == 2 && num_faces_c_dim == 2),
+        "Unary Broadcast Row requires a 2x2 face grid until tiny row broadcast is validated");
     LLK_ASSERT(transpose_of_faces == 0 || face_r_dim == 16, "Partial faces are not supported for transpose datacopy, face_r_dim must be 16 rows");
     LLK_ASSERT(
         transpose_of_faces == 0 || total_num_faces == 1 || num_faces_r_dim == num_faces_c_dim,
