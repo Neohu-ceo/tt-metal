@@ -60,6 +60,7 @@ inline void calculate_polygamma(uint32_t n_packed, uint32_t scale_packed) {
     float c_b4 = -(n1 * n2 * n3) / 720.0f;             // B_4 term coefficient
     float c_b6 = (n1 * n2 * n3 * n4 * n5) / 30240.0f;  // B_6 term coefficient
 
+    constexpr auto RECIP = APPROXIMATION_MODE ? 0 : is_fp32_dest_acc_en ? 2 : 1;
 #pragma GCC unroll 8
     for (int d = 0; d < ITERATIONS; d++) {
         sfpi::vFloat x = sfpi::dst_reg[0];
@@ -71,14 +72,7 @@ inline void calculate_polygamma(uint32_t n_packed, uint32_t scale_packed) {
             sfpi::vFloat xi = x + float(k);
 
             // Compute reciprocal first, then raise to power (avoids overflow of large intermediates)
-            sfpi::vFloat inv_xi;
-            if constexpr (APPROXIMATION_MODE) {
-                inv_xi = sfpu_reciprocal_iter<0>(xi);
-            } else if constexpr (is_fp32_dest_acc_en) {
-                inv_xi = sfpu_reciprocal_iter<2>(xi);
-            } else {
-                inv_xi = sfpu_reciprocal_iter<1>(xi);
-            }
+            sfpi::vFloat inv_xi = sfpu_reciprocal_iter<RECIP>(xi);
 
             sfpi::vFloat inv_power = inv_xi;
             for (int j = 1; j < n_plus_1; j++) {
@@ -93,14 +87,7 @@ inline void calculate_polygamma(uint32_t n_packed, uint32_t scale_packed) {
         // at z = x + NUM_TERMS:
         sfpi::vFloat z = x + float(NUM_TERMS);
 
-        sfpi::vFloat inv_z;
-        if constexpr (APPROXIMATION_MODE) {
-            inv_z = sfpu_reciprocal_iter<0>(z);
-        } else if constexpr (is_fp32_dest_acc_en) {
-            inv_z = sfpu_reciprocal_iter<2>(z);
-        } else {
-            inv_z = sfpu_reciprocal_iter<1>(z);
-        }
+        sfpi::vFloat inv_z = sfpu_reciprocal_iter<RECIP>(z);
 
         sfpi::vFloat inv_z2 = inv_z * inv_z;
 
