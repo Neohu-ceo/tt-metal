@@ -12,8 +12,12 @@ from ttexalens.context import Context
 from ttexalens.coordinate import OnChipCoordinate
 from ttexalens.debug_tensix import TensixDebug
 from ttexalens.hardware.risc_debug import CallstackEntry
+
+try:
+    from ttexalens.tt_exalens_lib import ParsedElfFile
+except ImportError:
+    ParsedElfFile = object
 from ttexalens.tt_exalens_lib import (
-    ParsedElfFile,
     TTException,
     arc_msg,
     callstack,
