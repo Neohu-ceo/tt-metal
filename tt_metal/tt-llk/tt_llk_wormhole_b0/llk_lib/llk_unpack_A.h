@@ -384,16 +384,15 @@ inline void _llk_unpack_A_(const std::uint32_t address, const std::uint32_t unpa
 }
 
 /**
- * @brief Restore unpacker datum-count state after single-operand (A) unpacking.
+ * @brief Complete single-operand (A) unpack cleanup.
  *
- * Resets the X-dimension address counter for the unpacker used by this broadcast mode back to
- * a full face worth of datums.
+ * Currently a no-op on Wormhole B0; kept as the symmetric cleanup call for
+ * @ref _llk_unpack_A_init_.
  *
  * @tparam BType: Broadcast type, values = <NONE/COL/ROW/SCALAR>
- * @param face_r_dim: Number of rows per face, used to compute the restored datum count.
  * @note Call @ref _llk_unpack_A_init_ with matching template args before this function.
  */
 template <BroadcastType BType = BroadcastType::NONE>
-inline void _llk_unpack_A_uninit_([[maybe_unused]] const ckernel::TensorShape tensor_shape = ckernel::DEFAULT_TENSOR_SHAPE)
+inline void _llk_unpack_A_uninit_()
 {
 }
