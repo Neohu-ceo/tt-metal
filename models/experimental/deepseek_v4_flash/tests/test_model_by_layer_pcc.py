@@ -27,7 +27,7 @@ from models.experimental.deepseek_v4_flash.tt.weight_loader import (
 )
 
 
-DEFAULT_MODEL_DIR = Path("/home/ttuser/models/hub/models--deepseek-ai--DeepSeek-V4-Flash")
+DEFAULT_MODEL_DIR = Path("/home/ttuser/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash")
 PCC_THRESHOLD = 0.99
 
 

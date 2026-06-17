@@ -658,6 +658,7 @@ class DeepSeekV4CSACompressor:
 
         ca, cb = ttnn.split(kv, dh, dim=3)
         ca_g, cb_g = ttnn.split(gate, dh, dim=3)
+        ttnn.ReadDeviceProfiler(self.device)
 
         # Shift Ca down one window: entry w sees window w-1's Ca; entry 0 sees a
         # zero-kv / -inf-gate filler (softmax weight 0).
@@ -786,6 +787,7 @@ class DeepSeekV4Attention(DeepSeekV4Module):
         scores = ttnn.matmul(q, ttnn.transpose(k, -2, -1), compute_kernel_config=_HIFI4)  # [B, H, S, Skv]
         scores = ttnn.multiply(scores, self.scaling)
         scores = ttnn.add(scores, mask)
+        ttnn.ReadDeviceProfiler(self.device)
 
         sinks = ttnn.from_torch(
             self.sinks_torch.expand(b, h, s, 1).contiguous(),
@@ -824,6 +826,7 @@ class DeepSeekV4Attention(DeepSeekV4Module):
         """
         b, s, _ = hidden.shape
         h, dh = self.num_heads, self.head_dim
+        ttnn.ReadDeviceProfiler(self.device)
 
         q_residual = self.q_a_norm(self.q_a_proj(hidden))  # [B, S, q_lora_rank]
         q = self.q_b_proj(q_residual)  # [B, S, H*Dh]
@@ -922,6 +925,7 @@ class DeepSeekV4Attention(DeepSeekV4Module):
             compressed = self.compressor.decode(hidden, cos_win, sin_win, kv_cache.compressor)
             if compressed is not None:
                 kv = ttnn.concat([kv, compressed], dim=2)  # [B, 1, L_sld + n_win, Dh]
+        ttnn.ReadDeviceProfiler(self.device)
 
         mask = ttnn.zeros([1, 1, s, kv.shape[2]], ttnn.bfloat16, ttnn.TILE_LAYOUT, self.device)
         attn = self._attention(q, kv, mask)  # [B, H, 1, Dh]
@@ -1019,6 +1023,7 @@ class DeepSeekV4TopKRouter(DeepSeekV4Module):
         logits = self.gate(x_flat)  # [1, 1, T, E]
         scores = ttnn.sqrt(ttnn.softplus(logits))
         biased = ttnn.add(scores, self.e_score_correction_bias)
+        ttnn.ReadDeviceProfiler(self.device)
 
         # Top-k selection -> one-hot mask. Scatter (rather than a >= threshold
         # compare) selects exactly k experts even if two scores collide under
@@ -1074,6 +1079,7 @@ class DeepSeekV4HashRouter(DeepSeekV4Module):
         logits = self.gate(x_flat)  # [1, 1, T, E]
         scores = ttnn.sqrt(ttnn.softplus(logits))
         t = x_flat.shape[2]
+        ttnn.ReadDeviceProfiler(self.device)
 
         # Static per-token expert selection -> host one-hot mask [1,1,T,E].
         eids = self.tid2eid[input_ids.reshape(-1).long()]  # [T, top_k]
@@ -1188,6 +1194,7 @@ class DeepSeekV4PreloadedExperts(DeepSeekV4Module):
         # were actually selected — skip the rest instead of looping all 256.
         rw_host = ttnn.to_torch(routing_weights).reshape(t, self.num_experts).float()
         hit = (rw_host.abs().sum(dim=0) > 0).nonzero().flatten().tolist()
+        ttnn.ReadDeviceProfiler(self.device)
 
         acc = None
         for e in hit:
@@ -1202,6 +1209,7 @@ class DeepSeekV4PreloadedExperts(DeepSeekV4Module):
             ttnn.deallocate(gate_up)
             ttnn.deallocate(act)
             ttnn.deallocate(down)
+            ttnn.ReadDeviceProfiler(self.device)
 
         if acc is None:  # no expert selected (degenerate) -> zeros
             acc = ttnn.multiply(x_flat, 0.0)
@@ -1246,10 +1254,12 @@ class DeepSeekV4Experts(DeepSeekV4Module):
         # Broadcast tokens across the expert (batch) axis: [1, E, T, H].
         x_e = ttnn.reshape(x_flat, [1, 1, t, self.hidden])
         x_e = ttnn.repeat(x_e, ttnn.Shape([1, e, 1, 1]))
+        ttnn.ReadDeviceProfiler(self.device)
 
         gate_up = ttnn.matmul(x_e, self.gate_up_proj, compute_kernel_config=_HIFI4)  # [1, E, T, 2I]
         act = self._apply_gate(gate_up)  # [1, E, T, I]
         down = ttnn.matmul(act, self.down_proj, compute_kernel_config=_HIFI4)  # [1, E, T, H]
+        ttnn.ReadDeviceProfiler(self.device)
 
         # Per-(token, expert) routing weight -> [1, E, T, 1] to broadcast over H.
         rw = ttnn.permute(routing_weights, [0, 3, 2, 1])  # [1, E, T, 1]
@@ -1291,15 +1301,22 @@ class DeepSeekV4SparseMoeBlock(DeepSeekV4Module):
         only for hash-routed layers (frozen ``tid2eid`` selection)."""
         b, s, h = hidden.shape
         x_flat = ttnn.reshape(hidden, [1, 1, b * s, h])
+        ttnn.ReadDeviceProfiler(self.device)
 
         if self.is_hash:
             routing_weights = self.gate(x_flat, input_ids)  # [1, 1, T, E]
         else:
             routing_weights = self.gate(x_flat)  # [1, 1, T, E]
+        ttnn.ReadDeviceProfiler(self.device)
+
         routed = self.experts(x_flat, routing_weights)  # [1, 1, T, H]
         routed = ttnn.reshape(routed, [b, s, h])
+        ttnn.ReadDeviceProfiler(self.device)
 
         shared = self.shared_experts(hidden)  # [B, S, H]
+
+        ttnn.ReadDeviceProfiler(self.device)
+
         return ttnn.add(routed, shared)
 
 
@@ -1378,6 +1395,7 @@ class DeepSeekV4HyperConnection(DeepSeekV4Module):
         pre_w = self.fn_pre(flat)  # [1,1,T,H]
         post_w = self.fn_post(flat)  # [1,1,T,H]
         comb_w = self.fn_comb(flat)  # [1,1,T,H*H]
+        ttnn.ReadDeviceProfiler(self.device)
 
         # pre = sigmoid(w*scale + b) + eps ; post = 2*sigmoid(w*scale + b).
         pre = ttnn.add(ttnn.sigmoid(ttnn.add(ttnn.multiply(pre_w, self.pre_scale), self.pre_b)), self.eps)
@@ -1536,6 +1554,7 @@ class DeepSeekV4DecoderLayer(DeepSeekV4Module):
         self.ffn_hc = DeepSeekV4HyperConnection(
             config, _strip_prefix(weights, "ffn_hc"), device, cache=cache.sub("ffn_hc")
         )
+        ttnn.ReadDeviceProfiler(self.device)
 
     def _mix(
         self, post: ttnn.Tensor, comb: ttnn.Tensor, sublayer_out: ttnn.Tensor, streams: ttnn.Tensor
@@ -1547,6 +1566,7 @@ class DeepSeekV4DecoderLayer(DeepSeekV4Module):
         """
         b, s, hc, d = streams.shape
         t = b * s
+        ttnn.ReadDeviceProfiler(self.device)
 
         # placement = post.unsqueeze(-1) * sublayer_out.unsqueeze(-2) -> [1,T,H,D].
         out = ttnn.reshape(sublayer_out, [1, t, 1, d])
@@ -1594,6 +1614,8 @@ class DeepSeekV4DecoderLayer(DeepSeekV4Module):
 
         post, comb, collapsed = self.ffn_hc(hidden_streams)
         mlp_out = self.mlp(self.post_attention_layernorm(collapsed), input_ids=input_ids)
+        ttnn.ReadDeviceProfiler(self.device)
+
         return self._mix(post, comb, mlp_out, hidden_streams)
 
     def decode(
@@ -1616,7 +1638,7 @@ class DeepSeekV4DecoderLayer(DeepSeekV4Module):
         post, comb, collapsed = self.attn_hc(hidden_streams)
         attn_out = self.self_attn.decode(self.input_layernorm(collapsed), cos, sin, neg_sin, cos_win, sin_win, kv_cache)
         hidden_streams = self._mix(post, comb, attn_out, hidden_streams)
-
+        ttnn.ReadDeviceProfiler(self.device)
         post, comb, collapsed = self.ffn_hc(hidden_streams)
         mlp_out = self.mlp(self.post_attention_layernorm(collapsed), input_ids=input_ids)
         return self._mix(post, comb, mlp_out, hidden_streams)
@@ -1805,6 +1827,7 @@ class DeepSeekV4Model(DeepSeekV4Module):
                     weight_dtype=weight_dtype,
                 )
             )
+            ttnn.ReadDeviceProfiler(current_device)
 
         # The head (hc_head / norm / external lm_head) must live where the *last*
         # decoder layer's output lands, not unconditionally on the final submesh —
@@ -1909,6 +1932,8 @@ class DeepSeekV4Model(DeepSeekV4Module):
 
     # -- per-layer RoPE tables / masks ------------------------------------------ #
     def _to_tt(self, t: torch.Tensor, device: ttnn.MeshDevice) -> ttnn.Tensor:
+        ttnn.ReadDeviceProfiler(device)
+
         return ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device)
 
     def _rope_tables(
@@ -2046,7 +2071,7 @@ class DeepSeekV4Model(DeepSeekV4Module):
                 cache_len=cache_len,
             )
             last_submesh_id = current_submesh_id
-
+            ttnn.ReadDeviceProfiler(this_device)
         return self.norm(self.hc_head(streams))
 
     def prefill(self, input_ids: torch.Tensor, rope: dict, cache_len: Optional[int] = None) -> ttnn.Tensor:
@@ -2097,7 +2122,7 @@ class DeepSeekV4Model(DeepSeekV4Module):
                 input_ids=ids,
             )
             last_submesh_id = current_submesh_id
-
+            ttnn.ReadDeviceProfiler(this_device)
         return self.norm(self.hc_head(streams))
 
     def _copy_hidden_states_between_submeshes(self, hidden_states, from_submesh_id, to_submesh_id):

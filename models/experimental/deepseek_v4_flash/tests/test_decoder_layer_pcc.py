@@ -43,8 +43,7 @@ import torch
 
 
 # Cached transformers 5.8.1 (the only install with ``deepseek_v4``).
-_CACHED_TRANSFORMERS = "/home/ttuser/.cache/uv/archive-v0/U5SPsIWJupLz-bDcPI13a"
-_DEFAULT_MODEL_DIR = "/home/ttuser/models/hub/models--deepseek-ai--DeepSeek-V4-Flash"
+_DEFAULT_MODEL_DIR = "/home/ttuser/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash"
 
 
 # --------------------------------------------------------------------------- #
@@ -111,7 +110,7 @@ def _reference_main() -> None:
 
     _orig_version = _md.version
     _md.version = lambda name: "0.22.0" if name.lower() == "tokenizers" else _orig_version(name)
-    sys.path.insert(0, _CACHED_TRANSFORMERS)
+
     # weight_loader / quant are standalone (torch + safetensors only); import by path.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tt"))
 
