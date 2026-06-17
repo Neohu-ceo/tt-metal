@@ -430,12 +430,13 @@ jobs:
           fi
           # Conditionally set this here so that it remains unset on forks,
           # otherwise it resolves an invalid URL and the job fails
-          REDIS_USER="${{ vars.REDIS_USER }}"
-          REDIS_PASSWORD="${{ secrets.REDIS_PASSWORD }}"
-          # REMOVE_ME: write to the primary Redis instead of the read-only replicas to test cache population.
-          # vars.REDIS_HOST normally resolves to redis-replicas.redis.svc.cluster.local (read endpoint).
-          REDIS_HOST="redis-master.redis.svc.cluster.local"
-          REDIS_PORT="${{ vars.REDIS_PORT }}"
+          # REMOVE_ME: use the writable ccache Redis credentials (writer account + writable host)
+          # instead of the read-only `reader`/REDIS_* pair, to test cache population.
+          # Mirrors the REDIS_CCACHE_* family used in sdk-examples.yaml.
+          REDIS_USER="${{ vars.REDIS_CCACHE_USER }}"
+          REDIS_PASSWORD="${{ secrets.REDIS_CCACHE_PASSWORD }}"
+          REDIS_HOST="${{ vars.REDIS_CCACHE_HOST }}"
+          REDIS_PORT="${{ vars.REDIS_CCACHE_PORT }}"
           # ccache 4.13 bug: read-only is std::optional<bool>; the write gate checks
           # `if (entry.config.read_only)` which is true whenever the optional HAS a value —
           # including when that value is false.  Omit the property entirely unless we
