@@ -119,7 +119,7 @@ inline void _llk_unpack_A_mop_config_(
         else
         {
             constexpr std::uint32_t innerloop = 1;
-            const std::uint32_t outerloop     = num_faces_r_dim;
+            constexpr std::uint32_t outerloop = 1;
             ckernel_template tmp(
                 outerloop, innerloop, unpack_srcb, num_faces_c_dim < MAX_NUM_FACES_C_DIM ? TT_OP_SETADCZW(p_setadc::UNP_B, 0, 0, 0, 1, 0b0001) : srcb_set_z_2);
             tmp.set_start_op(unpack_srca_set_dvalid);
