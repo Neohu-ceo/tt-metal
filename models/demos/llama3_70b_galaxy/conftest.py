@@ -1,8 +1,6 @@
 # SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
 
 # SPDX-License-Identifier: Apache-2.0
-import os
-
 import pytest
 import gc
 import ttnn
@@ -18,44 +16,14 @@ def ensure_devices(ensure_devices_tg):
     pass
 
 
-def _resolve_galaxy_fabric_config(galaxy_type=None):
-    try:
-        cluster_type = ttnn.cluster.get_cluster_type()
-    except (IndexError, KeyError, RuntimeError):
-        cluster_type = None
-    if cluster_type == ttnn.cluster.ClusterType.BLACKHOLE_GALAXY:
-        return ttnn.FabricConfig.FABRIC_1D
-    if galaxy_type == "6U" or cluster_type == ttnn.cluster.ClusterType.GALAXY:
-        return ttnn.FabricConfig.FABRIC_1D_RING
-    return ttnn.FabricConfig.FABRIC_1D
-
-
-@pytest.fixture
-def galaxy_type():
-    """
-    Galaxy form factor for model mesh layout. Prefer GALAXY_TYPE env.
-    BH UBB and WH Galaxy are 6U; TG / loudbox 4U uses FABRIC_1D.
-    """
-    env = os.environ.get("GALAXY_TYPE")
-    if env:
-        return env
-    try:
-        cluster_type = ttnn.cluster.get_cluster_type()
-    except (IndexError, KeyError, RuntimeError):
-        return None
-    if cluster_type in (ttnn.cluster.ClusterType.GALAXY, ttnn.cluster.ClusterType.BLACKHOLE_GALAXY):
-        return "6U"
-    if cluster_type == ttnn.cluster.ClusterType.TG:
-        return "4U"
-    return None
-
-
 @pytest.fixture
 def device_params(request, galaxy_type):
     # Get param dict passed in from test parametrize (or default to empty dict)
     params = getattr(request, "param", {}).copy()
 
     if "fabric_config" in params and params["fabric_config"] == True:
-        params["fabric_config"] = _resolve_galaxy_fabric_config(galaxy_type)
+        params["fabric_config"] = (
+            ttnn.FabricConfig.FABRIC_1D_RING if galaxy_type == "6U" else ttnn.FabricConfig.FABRIC_1D
+        )
 
     return params
