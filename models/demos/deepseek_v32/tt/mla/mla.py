@@ -23,6 +23,7 @@ import torch
 
 import ttnn
 from models.demos.deepseek_v3_d_p.tt.mla.mla import ttMLA as _ttMLAv3
+from models.demos.deepseek_v3_d_p.tt.mla.rope import get_rot_transformation_mat
 from models.demos.deepseek_v32.reference_cpu.model import ModelArgs
 from models.demos.deepseek_v32.reference_cpu.utils import precompute_freqs_cis
 from models.demos.deepseek_v32.tt import ops
@@ -67,7 +68,9 @@ class ttMLA(_ttMLAv3):
         # Indexer weights are v32-only — pop before v3 sees them, upload to device
         # after super().__init__ (which sets mesh_device / tp_axis / tp_factor).
         idx_host = {n: weights.pop(f"{n}.weight") for n in INDEXER_WEIGHT_NAMES if f"{n}.weight" in weights}
-        self.index_args = ModelArgs(max_batch_size=1)
+        # Indexer config: DS default (64 heads, θ=10000, non-interleaved rope) unless a caller
+        # passes a variant ModelArgs (GLM: 32 heads, θ=1e6, interleaved — see index_rope_interleave).
+        self.index_args = kwargs.pop("index_args", None) or ModelArgs(max_batch_size=1)
         super().__init__(config, weights, mesh_device, **kwargs)
         self._has_indexer = bool(idx_host)
         # Device index key cache (backlog 19): replicated, natural order, grown by
@@ -78,12 +81,20 @@ class ttMLA(_ttMLAv3):
             self._build_index_rope_tables()
 
     def _build_index_rope_tables(self):
-        """Precompute device cos/sin for the indexer's non-interleaved RoPE
-        (backlog 19 / issue #4). HF rotate_half layout: halves repeated → [1,1,max_seq,64].
-        Probe-verified vs reference apply_rotary_emb(interleaved=False), PCC 0.99999."""
+        """Precompute device cos/sin for the indexer RoPE. DS (default): non-interleaved
+        (rotate_half) — halves repeated [c0,c1,..,c0,c1,..] → rotary_embedding_hf
+        (probe-verified vs apply_rotary_emb(interleaved=False), PCC 0.99999). GLM
+        (index_args.index_rope_interleave): interleaved — Meta-style duplicated pairs
+        [c0,c0,c1,c1,..] + trans_mat → rotary_embedding_llama (matches the MLA's own rope)."""
         freqs = precompute_freqs_cis(self.index_args)  # [max_seq, 32] complex; rope half = 64
-        cos = torch.cat([freqs.real, freqs.real], dim=-1).reshape(1, 1, freqs.shape[0], 64).to(torch.bfloat16)
-        sin = torch.cat([freqs.imag, freqs.imag], dim=-1).reshape(1, 1, freqs.shape[0], 64).to(torch.bfloat16)
+        if self.index_args.index_rope_interleave:
+            cos = torch.stack((freqs.real, freqs.real), dim=-1).flatten(-2)  # [max_seq, 64]
+            sin = torch.stack((freqs.imag, freqs.imag), dim=-1).flatten(-2)
+        else:
+            cos = torch.cat([freqs.real, freqs.real], dim=-1)
+            sin = torch.cat([freqs.imag, freqs.imag], dim=-1)
+        cos = cos.reshape(1, 1, freqs.shape[0], 64).to(torch.bfloat16)
+        sin = sin.reshape(1, 1, freqs.shape[0], 64).to(torch.bfloat16)
         repl = lambda t: ttnn.from_torch(
             t,
             device=self.mesh_device,
@@ -92,6 +103,7 @@ class ttMLA(_ttMLAv3):
             mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
         )
         self._idx_cos, self._idx_sin = repl(cos), repl(sin)
+        self._idx_trans = repl(get_rot_transformation_mat()) if self.index_args.index_rope_interleave else None
 
     def _upload_indexer_weights(self, w):
         """Indexer weights → device (backlog 6: stems on device, replicated across TP).
@@ -139,9 +151,12 @@ class ttMLA(_ttMLAv3):
         nope = ttnn.slice(x, [0, 0, 0, 64], [1, h, glob, self.index_args.index_head_dim])
         cos = ttnn.slice(self._idx_cos, [0, 0, start_pos, 0], [1, 1, start_pos + glob, 64])
         sin = ttnn.slice(self._idx_sin, [0, 0, start_pos, 0], [1, 1, start_pos + glob, 64])
-        pe = ttnn.experimental.rotary_embedding_hf(
-            pe, cos, sin, is_decode_mode=False, compute_kernel_config=self.hifi4_fp32_compute_kernel_config
-        )
+        if self._idx_trans is not None:  # GLM: interleaved RoPE (Meta-style + trans_mat)
+            pe = ttnn.experimental.rotary_embedding_llama(pe, cos, sin, self._idx_trans, is_decode_mode=False)
+        else:  # DS: non-interleaved (rotate_half)
+            pe = ttnn.experimental.rotary_embedding_hf(
+                pe, cos, sin, is_decode_mode=False, compute_kernel_config=self.hifi4_fp32_compute_kernel_config
+            )
         return ttnn.concat([pe, nope], dim=-1)
 
     def _indexer_write_k(self, hidden_states: ttnn.Tensor, seq_len: int, start_pos: int):
