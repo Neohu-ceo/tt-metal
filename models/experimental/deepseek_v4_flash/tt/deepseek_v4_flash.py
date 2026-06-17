@@ -1177,16 +1177,6 @@ class DeepSeekV4PreloadedExperts(DeepSeekV4Module):
                 )
             )
 
-    def expert_matmul_weights(self, e: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Device-resident (BFloat4) weights for expert ``e`` as host fp32 torch
-        ``(gate_up [H, 2I], down [I, H])`` — exactly what the on-device matmuls
-        consume. Handy for parity references that must use the same quantized
-        weights rather than the full-precision originals.
-        """
-        gate_up = ttnn.to_torch(self._gate_up[e]).reshape(self.hidden, 2 * self.intermediate).float()
-        down = ttnn.to_torch(self._down[e]).reshape(self.intermediate, self.hidden).float()
-        return gate_up, down
-
     def forward(self, x_flat: ttnn.Tensor, routing_weights: ttnn.Tensor) -> ttnn.Tensor:
         """``x_flat`` ``[1,1,T,H]`` and ``routing_weights`` ``[1,1,T,E]``; returns ``[1,1,T,H]``."""
         t = x_flat.shape[2]
@@ -1216,57 +1206,6 @@ class DeepSeekV4PreloadedExperts(DeepSeekV4Module):
         return acc
 
 
-class DeepSeekV4Experts(DeepSeekV4Module):
-    """ttnn port of ``DeepseekV4Experts`` (GPT-OSS-style, bias-free, dense).
-
-    Weights are stored per-expert as 3D parameters in the reference:
-      ``gate_up_proj`` ``[E, 2I, H]`` and ``down_proj`` ``[E, H, I]``.
-    We pre-transpose them to ``[1, E, H, 2I]`` / ``[1, E, I, H]`` so a single
-    batched matmul (batch axis = expert) projects all experts at once.
-    """
-
-    def __init__(self, config, weights: dict, device: ttnn.MeshDevice, cache: Optional[WeightCache] = None):
-        self.device = device
-        self.num_experts = config.num_local_experts
-        self.intermediate = config.moe_intermediate_size
-        self.hidden = config.hidden_size
-        self.limit = config.swiglu_limit
-        cache = _as_cache(cache)
-
-        gate_up = _materialize(weights["experts.gate_up_proj"], cache.file("experts.gate_up_proj"), ttnn.bfloat16)
-        if gate_up is not None:  # [E, 2I, H] -> [1, E, H, 2I]
-            gate_up = gate_up.transpose(1, 2).contiguous().unsqueeze(0)
-        self.gate_up_proj = _load_weight(gate_up, device, cache_file_name=cache.file("experts.gate_up_proj"))
-
-        down = _materialize(weights["experts.down_proj"], cache.file("experts.down_proj"), ttnn.bfloat16)
-        if down is not None:  # [E, H, I] -> [1, E, I, H]
-            down = down.transpose(1, 2).contiguous().unsqueeze(0)
-        self.down_proj = _load_weight(down, device, cache_file_name=cache.file("experts.down_proj"))
-
-    def _apply_gate(self, gate_up: ttnn.Tensor) -> ttnn.Tensor:
-        """Clamp + SiLU-GLU on the packed ``[..., 2I]`` gate_up output."""
-        return _swiglu_gate(gate_up, self.intermediate, self.limit)
-
-    def forward(self, x_flat: ttnn.Tensor, routing_weights: ttnn.Tensor) -> ttnn.Tensor:
-        """``x_flat`` ``[1,1,T,H]`` and ``routing_weights`` ``[1,1,T,E]``; returns ``[1,1,T,H]``."""
-        e = self.num_experts
-        t = x_flat.shape[2]
-        # Broadcast tokens across the expert (batch) axis: [1, E, T, H].
-        x_e = ttnn.reshape(x_flat, [1, 1, t, self.hidden])
-        x_e = ttnn.repeat(x_e, ttnn.Shape([1, e, 1, 1]))
-        ttnn.ReadDeviceProfiler(self.device)
-
-        gate_up = ttnn.matmul(x_e, self.gate_up_proj, compute_kernel_config=_HIFI4)  # [1, E, T, 2I]
-        act = self._apply_gate(gate_up)  # [1, E, T, I]
-        down = ttnn.matmul(act, self.down_proj, compute_kernel_config=_HIFI4)  # [1, E, T, H]
-        ttnn.ReadDeviceProfiler(self.device)
-
-        # Per-(token, expert) routing weight -> [1, E, T, 1] to broadcast over H.
-        rw = ttnn.permute(routing_weights, [0, 3, 2, 1])  # [1, E, T, 1]
-        weighted = ttnn.multiply(down, rw)  # [1, E, T, H]
-        return ttnn.experimental.fast_reduce_nc(weighted, dims=[1])  # [1, 1, T, H]
-
-
 class DeepSeekV4SparseMoeBlock(DeepSeekV4Module):
     """ttnn port of ``DeepseekV4SparseMoeBlock`` (standard ``moe`` layer).
 
@@ -1278,7 +1217,7 @@ class DeepSeekV4SparseMoeBlock(DeepSeekV4Module):
         config,
         weights: dict,
         device: ttnn.MeshDevice,
-        experts=None,
+        experts,
         gate=None,
         cache: Optional[WeightCache] = None,
         weight_dtype: ttnn.DataType = ttnn.bfloat16,
@@ -1290,10 +1229,9 @@ class DeepSeekV4SparseMoeBlock(DeepSeekV4Module):
         # first ``num_hash_layers`` layers); otherwise the learned top-k router.
         self.gate = gate if gate is not None else DeepSeekV4TopKRouter(config, weights, device, cache=cache)
         self.is_hash = isinstance(self.gate, DeepSeekV4HashRouter)
-        # ``experts`` may be injected (e.g. a device-resident BFloat4
-        # :class:`DeepSeekV4PreloadedExperts` for the real 256-expert
-        # checkpoint); otherwise build the dense stacked-weights variant.
-        self.experts = experts if experts is not None else DeepSeekV4Experts(config, weights, device, cache=cache)
+        # The routed-expert compute (a :class:`DeepSeekV4PreloadedExperts` keeping
+        # all 256 experts resident on device in BFloat4_b) is always injected.
+        self.experts = experts
         self.shared_experts = DeepSeekV4MLP(weights, "shared_experts", device, cache=cache, weight_dtype=weight_dtype)
 
     def forward(self, hidden: ttnn.Tensor, input_ids: Optional[torch.Tensor] = None) -> ttnn.Tensor:

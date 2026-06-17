@@ -124,7 +124,7 @@ def test_full_model_decode_demo(mesh_device, reset_seeds, text: str) -> None:
     config._attn_implementation = "eager"
     tokenizer = AutoTokenizer.from_pretrained(loader.snapshot_dir)
 
-    max_new_tokens = 4  # int(os.environ.get("DEEPSEEK_V4_MAX_NEW_TOKENS", "16"))
+    max_new_tokens = int(os.environ.get("DEEPSEEK_V4_MAX_NEW_TOKENS", "1024"))
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else config.eos_token_id
     eos_id = config.eos_token_id
 
@@ -165,27 +165,47 @@ def test_full_model_decode_demo(mesh_device, reset_seeds, text: str) -> None:
     input_ids = torch.tensor(padded, dtype=torch.long).unsqueeze(0)
 
     hidden = model.prefill(input_ids, _slice_rope(rope, seq_len), cache_len=real_len)  # [1, S, D]
-    # logits = ttnn.to_torch(lm_head(hidden)).reshape(seq_len, -1).float()
-    # next_id = int(logits[real_len - 1].argmax().item())
-    # generated: list[int] = [next_id]
-    # logger.info(f"prefill ({real_len} tokens) -> token id {next_id} {tokenizer.decode([next_id])!r}")
+    logits = ttnn.to_torch(lm_head(hidden)).reshape(seq_len, -1).float()
+    next_id = int(logits[real_len - 1].argmax().item())
+    generated: list[int] = [next_id]
+    logger.info(f"prefill ({real_len} tokens) -> token id {next_id} {tokenizer.decode([next_id])!r}")
 
-    # # Each step feeds the previously generated token at its absolute position and
-    # # reads back the single-token logits (no recompute over the prior context).
-    # for step in range(1, max_new_tokens):
-    #     if next_id == eos_id:
-    #         logger.info("hit EOS; stopping")
-    #         break
-    #     pos = real_len + step - 1  # absolute position of the token being fed back
-    #     if pos >= max_seq:  # ran past the precomputed RoPE span
-    #         logger.warning(f"hit max RoPE length {max_seq}; stopping at {len(generated)} tokens")
-    #         break
-    #     hidden = model.decode(next_id, pos, rope)  # [1, 1, D]
-    #     logits = ttnn.to_torch(lm_head(hidden)).reshape(1, -1).float()
-    #     next_id = int(logits[0].argmax().item())
-    #     generated.append(next_id)
-    #     logger.info(f"step {step:3d} (pos {pos:4d}): token id {next_id} {tokenizer.decode([next_id])!r}")
+    # Each step feeds the previously generated token at its absolute position and
+    # reads back the single-token logits (no recompute over the prior context).
+    import time
 
-    # assert generated, "no tokens were generated"
-    # logger.info(f"PROMPT    : {tokenizer.decode(prompt_ids)!r}")
-    # logger.info(f"GENERATED : {tokenizer.decode(generated)!r}  ({len(generated)} tokens)")
+    decode_tokens = 0
+    decode_time = 0.0
+    for step in range(1, max_new_tokens):
+        if next_id == eos_id:
+            logger.info("hit EOS; stopping")
+            break
+        pos = real_len + step - 1  # absolute position of the token being fed back
+        if pos >= max_seq:  # ran past the precomputed RoPE span
+            logger.warning(f"hit max RoPE length {max_seq}; stopping at {len(generated)} tokens")
+            break
+        t0 = time.perf_counter()
+        hidden = model.decode(next_id, pos, rope)  # [1, 1, D]
+        logits = ttnn.to_torch(lm_head(hidden)).reshape(1, -1).float()  # forces device sync
+        next_id = int(logits[0].argmax().item())
+        decode_time += time.perf_counter() - t0
+        decode_tokens += 1
+        generated.append(next_id)
+        logger.info(f"step {step:3d} (pos {pos:4d}): token id {next_id} {tokenizer.decode([next_id])!r}")
+
+        # Running decode throughput, reported every 10 generated tokens.
+        if decode_tokens % 10 == 0:
+            logger.info(
+                f"decode throughput: {decode_tokens / decode_time:.2f} tok/s "
+                f"({decode_tokens} tokens in {decode_time:.2f}s)"
+            )
+
+    if decode_tokens:
+        logger.info(
+            f"decode throughput (final): {decode_tokens / decode_time:.2f} tok/s "
+            f"({decode_tokens} tokens in {decode_time:.2f}s)"
+        )
+
+    assert generated, "no tokens were generated"
+    logger.info(f"PROMPT    : {tokenizer.decode(prompt_ids)!r}")
+    logger.info(f"GENERATED : {tokenizer.decode(generated)!r}  ({len(generated)} tokens)")

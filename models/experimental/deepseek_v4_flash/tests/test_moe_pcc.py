@@ -156,6 +156,7 @@ from loguru import logger  # noqa: E402
 import ttnn  # noqa: E402
 from models.common.utility_functions import comp_allclose, comp_pcc  # noqa: E402
 from models.experimental.deepseek_v4_flash.tt.deepseek_v4_flash import (  # noqa: E402
+    DeepSeekV4PreloadedExperts,
     DeepSeekV4SparseMoeBlock,
 )
 
@@ -197,7 +198,18 @@ def test_moe_pcc(device, reset_seeds, tmp_path, batch_size: int, seq_len: int) -
     bundle = torch.load(ref_path, weights_only=False)
     cfg = types.SimpleNamespace(**bundle["config"])
 
-    moe = DeepSeekV4SparseMoeBlock(cfg, bundle["state_dict"], device)
+    # Routed experts arrive stacked (``[E, 2I, H]`` / ``[E, H, I]``); feed them to
+    # the on-device experts via a per-expert provider. bf16 storage keeps the PCC
+    # comparison about compute fidelity rather than the BFloat4 storage choice.
+    state_dict = bundle["state_dict"]
+    stacked_gate_up = state_dict["experts.gate_up_proj"]  # [E, 2I, H]
+    stacked_down = state_dict["experts.down_proj"]  # [E, H, I]
+
+    def _provider(e: int):
+        return stacked_gate_up[e], stacked_down[e]  # ([2I, H], [H, I])
+
+    experts = DeepSeekV4PreloadedExperts(cfg, _provider, device, dtype=ttnn.bfloat16)
+    moe = DeepSeekV4SparseMoeBlock(cfg, state_dict, device, experts=experts)
 
     hidden_tt = _to_tt(bundle["hidden"], device)
     out_tt = moe.forward(hidden_tt)
