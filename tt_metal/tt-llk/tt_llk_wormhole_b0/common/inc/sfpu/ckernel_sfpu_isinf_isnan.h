@@ -127,23 +127,23 @@ inline void _calculate_sfpu_isinf_isnan_()
 
         if constexpr (operation == SfpuType::isinf)
         {
-            val = _calculate_isinf_<APPROXIMATION_MODE>(in);
+            val = _calculate_isinf_<APPROXIMATION_MODE>(val);
         }
         else if constexpr (operation == SfpuType::isposinf)
         {
-            val = _calculate_isposinf_<APPROXIMATION_MODE>(in);
+            val = _calculate_isposinf_<APPROXIMATION_MODE>(val);
         }
         else if constexpr (operation == SfpuType::isneginf)
         {
-            val = _calculate_isneginf_<APPROXIMATION_MODE>(in);
+            val = _calculate_isneginf_<APPROXIMATION_MODE>(val);
         }
         else if constexpr (operation == SfpuType::isnan)
         {
-            val = _calculate_isnan_<APPROXIMATION_MODE>(in);
+            val = _calculate_isnan_<APPROXIMATION_MODE>(val);
         }
         else if constexpr (operation == SfpuType::isfinite)
         {
-            val = _calculate_isfinite_<APPROXIMATION_MODE>(in);
+            val = _calculate_isfinite_<APPROXIMATION_MODE>(val);
         }
 
         sfpi::dst_reg[0] = val;
