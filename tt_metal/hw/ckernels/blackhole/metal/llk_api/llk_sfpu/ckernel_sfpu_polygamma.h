@@ -95,21 +95,27 @@ inline void calculate_polygamma(uint32_t n_packed, uint32_t scale_packed) {
         // For the remaining sum Σ_{k=NUM_TERMS}^{∞} 1/(x+k)^(n+1)
         // at z = x + NUM_TERMS:
         sfpi::vFloat z = x + float(NUM_TERMS);
+
         sfpi::vFloat inv_z = sfpu_reciprocal_iter<RECIP>(z);
         sfpi::vFloat inv_z2 = inv_z * inv_z;
 
         // Use PolynomialEvaluator for the Bernoulli polynomial in the tail:
         // E = inv_nf + c_b2*inv_z2 + c_b4*inv_z2^2 + c_b6*inv_z2^3
         sfpi::vFloat E = PolynomialEvaluator::eval(inv_z2, inv_nf, c_b2, c_b4, c_b6);
+
         sfpi::vFloat tail = E + 0.5f * inv_z;
 
-        // Compute inv_z^n by repeated multiplication
-        sfpi::vFloat inv_z_n = inv_z;  // inv_z^1
-        for (int j = 1; j < n; j++) {
-            inv_z_n = inv_z_n * inv_z;  // inv_z^n
+        // Scale by inv_z^(n+1), taking advantage of inv_z^2's
+        // computation above
+        if (!(n & 1)) {
+            tail *= inv_z;
+        }
+        if (n) {
+            // x^2n == (x^2)^n
+            tail = power(inv_z2, (n + 1) >> 1, tail);
         }
 
-        sum += tail * inv_z_n;
+        sum += tail;
 
         // Apply scale: (-1)^(n+1) * n!
         sfpi::vFloat result = sum * scale;
