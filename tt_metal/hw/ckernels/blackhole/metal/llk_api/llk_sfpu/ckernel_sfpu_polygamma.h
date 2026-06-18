@@ -59,6 +59,21 @@ inline void calculate_polygamma(uint32_t n_packed, uint32_t scale_packed) {
     float c_b6 = (n1 * n2 * n3 * n4 * n5) / 30240.0f;  // B_6 term coefficient
 
     constexpr auto RECIP = APPROXIMATION_MODE ? 0 : is_fp32_dest_acc_en ? 2 : 1;
+
+    auto power = [] __attribute__((always_inline)) (sfpi::vFloat x, int pwr, sfpi::vFloat val = 1.0f) {
+        for (;;) {
+            if (pwr & 1) {
+                val *= x;
+            }
+            pwr >>= 1;
+            if (!pwr) {
+                break;
+            }
+            x *= x;
+        }
+        return val;
+    };
+
 #pragma GCC unroll 8
     for (int d = 0; d < ITERATIONS; d++) {
         sfpi::vFloat x = sfpi::dst_reg[0];
@@ -71,11 +86,7 @@ inline void calculate_polygamma(uint32_t n_packed, uint32_t scale_packed) {
 
             // Compute reciprocal first, then raise to power (avoids overflow of large intermediates)
             sfpi::vFloat inv_xi = sfpu_reciprocal_iter<RECIP>(xi);
-
-            sfpi::vFloat inv_power = inv_xi;
-            for (int j = 1; j <= n; j++) {
-                inv_power = inv_power * inv_xi;
-            }
+            sfpi::vFloat inv_power = power(inv_xi, n, inv_xi);
 
             sum += inv_power;
         }
